@@ -77,7 +77,15 @@ def _type_vtable_at(
             updated_members.append(member)
             continue
 
-        fp_type = Type.pointer(bv.arch, func.type)
+        # Skip slots whose target has no derived prototype - pointering a void
+        # type produces void* and silently leaves the slot un-typed.
+        ft = func.type
+        if ft is None or ft.type_class != TypeClass.FunctionTypeClass:
+            stats["no_func"] += 1
+            updated_members.append(member)
+            continue
+
+        fp_type = Type.pointer(bv.arch, ft)
         updated_members.append(StructureMember(fp_type, member.name, member.offset))
         updated_funcs.add(func)
         stats["typed"] += 1
@@ -129,13 +137,14 @@ def _do_type_all_vtables(bv: BinaryView, task: BackgroundTaskThread) -> None:
     task.progress = f"VTables: queueing re-analysis for {len(all_updated_funcs)} function(s)..."
     for func in all_updated_funcs:
         func.mark_caller_updates_required(FunctionUpdateType.UserFunctionUpdate)
+
+    bv.commit_undo_actions()
+
     if all_updated_funcs:
         bv.update_analysis()
         log_info(
             f"vtable_improve: queued re-analysis for {len(all_updated_funcs)} function(s)"
         )
-
-    bv.commit_undo_actions()
 
     if not processed:
         if seen_structs:
