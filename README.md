@@ -1,5 +1,7 @@
 # Binary Ninja Plugins
 
+> These plugins are expirimental and designed for personal use.
+
 Binary Ninja plugins for analyzing MSVC x86-64 binaries. They are to assist with vtable recovery and XFG (eXtended Flow Guard) analysis.
 
 Requires Binary Ninja with an x86-64 binary open. The vtable plugins also need BN's RTTI analysis to have already run. All plugins bail cleanly on other architectures.
