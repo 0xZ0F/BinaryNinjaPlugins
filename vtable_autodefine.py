@@ -54,7 +54,7 @@ _MAX_SLOTS = 512
 # Per-bv cache of {vtable_addr: class_byte_offset} stored on bv.session_data.
 # Using session_data instead of a module-level dict avoids stale entries across
 # different open binaries and clears automatically when a binary is closed.
-_OFFSET_CACHE_KEY = "_vtable_class_offset_cache"
+_OFFSET_CACHE_KEY = "vtable_autodefine:class_offset_cache"
 
 
 def _check_arch(bv: BinaryView, title: str) -> bool:
@@ -223,7 +223,8 @@ def _create_vtable_struct(
         fp_addr = int.from_bytes(raw, "little") if raw and len(raw) == 8 else 0
         func = bv.get_function_at(fp_addr) if fp_addr else None
 
-        if func is not None:
+        ft = func.type if func is not None else None
+        if func is not None and ft is not None and ft.type_class == TypeClass.FunctionTypeClass:
             base = _slot_field_name(bv, func, i)
             if base in used_names:
                 used_names[base] += 1
@@ -231,7 +232,6 @@ def _create_vtable_struct(
             else:
                 used_names[base] = 0
                 field_name = base
-            ft = func.type
             if not ft.can_return:
                 # Virtual overrides can return normally — don't let one
                 # noreturn implementation poison every call through this slot.
@@ -834,13 +834,14 @@ def _do_process_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
     task.progress = f"VTables: queueing re-analysis for {len(all_funcs)} function(s)..."
     for func in all_funcs:
         func.mark_caller_updates_required(FunctionUpdateType.UserFunctionUpdate)
+
+    bv.commit_undo_actions()
+
     if all_funcs:
         bv.update_analysis()
         log_info(
             f"vtable_autodefine: queued re-analysis for {len(all_funcs)} function(s)"
         )
-
-    bv.commit_undo_actions()
 
     show_message_box(
         "Auto-Define Vtable Structs",
@@ -897,9 +898,9 @@ def _do_process_for_address(bv: BinaryView, addr: int, task: BackgroundTaskThrea
     )
     for func in funcs_set:
         func.mark_caller_updates_required(FunctionUpdateType.UserFunctionUpdate)
+    bv.commit_undo_actions()
     if funcs_set:
         bv.update_analysis()
-    bv.commit_undo_actions()
     show_message_box("Auto-Define Vtable Structs", msg)
 
 

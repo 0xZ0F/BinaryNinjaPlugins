@@ -17,8 +17,8 @@ into RAX before each `movabs r10` at the reported call sites.
 Commands added (grouped under Plugins -> XFG):
 
   XFG -> Cross-References:
-    "Find Here"                       - right-click address; xrefs for the function
-                                        containing the cursor + report
+    "Find Here"                       - right-click address; add xrefs for the function
+                                        containing the cursor and log the count
     "Find in This Function"           - right-click function; same as above for func
     "Add All"                         - whole binary; add every resolvable xref
     "Remove All"                      - whole binary; remove all xrefs added by us
@@ -37,6 +37,11 @@ Commands added (grouped under Plugins -> XFG):
                                         set_user_indirect_branches so HLIL can resolve
                                         (*(*ptr+N))(ptr) patterns
     "Remove All"                      - whole binary; clear all targets set by Resolve All
+
+  XFG -> Reset Hash Map Cache         - invalidate the cached XFG hash map (use after
+                                        adding/removing functions mid-session; the cache
+                                        also self-invalidates when a slow-path scan
+                                        finds a target the cache was missing)
 
 Recommended keybindings (set in Settings -> Keybindings; BN does not let plugins
 register hotkeys directly, so this is a manual one-time step per workstation):
@@ -124,15 +129,16 @@ def _build_hash_map(bv: BinaryView) -> dict:
     return m
 
 
-_HASH_MAP_KEY = "_xfg_hash_map"
+_HASH_MAP_KEY = "xfg_xrefs:hash_map"
 
 
 def _get_hash_map(bv: BinaryView) -> dict:
     """Return the cached XFG hash map for bv, building it on first use.
 
-    Stored on bv.session_data so per-binary caches don't collide. Cache is not
-    invalidated when functions are added or removed - if the binary changes
-    significantly during a session, run "XFG -> Reset Hash Map Cache".
+    Stored on bv.session_data under a plugin-namespaced key. Returned dict is
+    treated as immutable by callers; never mutate it. The cache self-invalidates
+    when _find_targets_for_hash falls back to a binary scan and locates a hash
+    the cache was missing (see _record_slow_path_hit).
     """
     cached = bv.session_data.get(_HASH_MAP_KEY)
     if cached is not None:
@@ -146,6 +152,19 @@ def _reset_hash_map(bv: BinaryView) -> None:
     """Invalidate the cached XFG hash map for bv."""
     bv.session_data.pop(_HASH_MAP_KEY, None)
     log_info("xfg_xrefs: hash map cache cleared")
+
+
+def _record_slow_path_hit(bv: BinaryView, func_hash: int, target_addrs: list) -> None:
+    """Patch the cached hash map after a slow-path scan found a missing entry.
+
+    The slow path runs when _find_targets_for_hash misses the cache and resorts
+    to scanning bytes for the function-hash. If it finds something, the cache is
+    out of date - record the new entry so subsequent calls don't re-scan.
+    """
+    cached = bv.session_data.get(_HASH_MAP_KEY)
+    if cached is None:
+        return
+    cached[func_hash] = list(target_addrs)
 
 
 def _search_pattern(bv: BinaryView, call_hash: int) -> list[int]:
@@ -209,6 +228,9 @@ def _find_targets_for_hash(bv: BinaryView, call_hash: int, hash_map: dict) -> li
     falls back to a raw binary search for the stored hash value when the target
     hasn't been added to bv.functions yet.  The stored XFG hash is func_hash
     (bit 0 set) located 8 bytes before the function entry point.
+
+    A successful slow-path scan also patches the session cache so repeated
+    lookups for this hash don't re-scan the binary.
     """
     func_hash = call_hash | 0x01
     known = hash_map.get(func_hash)
@@ -224,6 +246,9 @@ def _find_targets_for_hash(bv: BinaryView, call_hash: int, hash_map: dict) -> li
             break
         targets.append(found + 8)
         addr = found + 8
+
+    if targets:
+        _record_slow_path_hit(bv, func_hash, targets)
     return targets
 
 
@@ -523,17 +548,14 @@ def _resolve_one_xfg_site(
     return "resolved", comment
 
 
-def _clear_one_xfg_site(bv: BinaryView, movabs_addr: int, hash_map: dict) -> str:
+def _clear_one_xfg_site(bv: BinaryView, movabs_addr: int) -> str:
     """Clear XFG branch targets and comment at one movabs r10 site.
 
-    Returns one of: "cleared", "no-targets", "no-call", "no-func".
+    Returns one of: "cleared", "no-call", "no-func".
+
+    Does NOT require a hash match - cleanup must succeed even when the
+    original target was renamed, deleted, or its function-hash byte changed.
     """
-    hash_bytes = bv.read(movabs_addr + 2, 8)
-    if not hash_bytes or len(hash_bytes) < 8:
-        return "no-targets"
-    call_hash = int.from_bytes(hash_bytes, "little")
-    if not _find_targets_for_hash(bv, call_hash, hash_map):
-        return "no-targets"
     call_addr = _find_xfg_call(bv, movabs_addr)
     if call_addr is None:
         return "no-call"
@@ -656,14 +678,7 @@ def _cmd_resolve_indirect_calls(bv: BinaryView) -> None:
 
 def _do_remove_indirect_calls(bv: BinaryView, task: BackgroundTaskThread) -> None:
     """Background worker for Remove All XFG Indirect Branch Targets."""
-    task.progress = "XFG: building function hash map..."
-    hash_map = _get_hash_map(bv)
-    if not hash_map:
-        show_message_box(
-            "Remove XFG Indirect Branch Targets",
-            "No XFG-protected functions found.",
-        )
-        return
+    task.progress = "XFG: clearing branch targets..."
 
     bv.begin_undo_actions()
     cleared = 0
@@ -677,7 +692,7 @@ def _do_remove_indirect_calls(bv: BinaryView, task: BackgroundTaskThread) -> Non
         if found is None:
             break
 
-        if _clear_one_xfg_site(bv, found, hash_map) == "cleared":
+        if _clear_one_xfg_site(bv, found) == "cleared":
             cleared += 1
 
         sites += 1
@@ -777,10 +792,9 @@ def _cmd_remove_here(bv: BinaryView, addr: int) -> None:
         )
         return
     movabs_addr, call_addr = site
-    hash_map = _get_hash_map(bv)
 
     bv.begin_undo_actions()
-    status = _clear_one_xfg_site(bv, movabs_addr, hash_map)
+    status = _clear_one_xfg_site(bv, movabs_addr)
     bv.commit_undo_actions()
     bv.update_analysis()
 
@@ -921,13 +935,6 @@ def _cmd_remove_in_func(bv: BinaryView, func: Function) -> None:
     """Right-click: clear every XFG call site inside func."""
     if not _check_arch(bv, "Remove XFG Call Targets in This Function"):
         return
-    hash_map = _get_hash_map(bv)
-    if not hash_map:
-        show_message_box(
-            "Remove XFG Call Targets in This Function",
-            "No XFG-protected functions found in this binary.",
-        )
-        return
 
     bv.begin_undo_actions()
     cleared = 0
@@ -941,7 +948,7 @@ def _cmd_remove_in_func(bv: BinaryView, func: Function) -> None:
 
     for r in ranges:
         for movabs_addr, _call in _enumerate_xfg_sites_in_range(bv, r.start, r.end):
-            if _clear_one_xfg_site(bv, movabs_addr, hash_map) == "cleared":
+            if _clear_one_xfg_site(bv, movabs_addr) == "cleared":
                 cleared += 1
 
     bv.commit_undo_actions()
