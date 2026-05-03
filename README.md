@@ -26,7 +26,7 @@ For each class it finds, the pipeline runs in this order:
 6. Updates the class struct with correctly-typed vtable pointer fields
 7. Retypes `this` in constructors and virtual methods so HLIL promotes field accesses
 
-All commands are under Plugins → VTables:
+All commands are under Plugins -> VTables:
 
 | Command | How to invoke | Description |
 |---------|---------------|-------------|
@@ -40,7 +40,7 @@ Navigate to Virtual Function reads the vtable slot offset from the call instruct
 
 Re-types vtable struct fields from `void*` to proper named function pointers. Run this after `vtable_autodefine` if you still see raw output like `(*(r12->__offset(0x0).q + 0x230))(r12, 0)`. After it runs, calls display as `obj->vtable->MethodName(...)`.
 
-The single command is under Plugins → VTables:
+The single command is under Plugins -> VTables:
 
 | Command | How to invoke | Description |
 |---------|---------------|-------------|
@@ -49,13 +49,13 @@ The single command is under Plugins → VTables:
 ### Recommended VTable Workflow
 
 1. Open the binary and let BN finish its RTTI analysis.
-2. Run **VTables → Auto-Define for All Classes**. Wait for BN's analysis indicator to settle.
-3. If virtual calls still appear as raw pointer arithmetic, run **VTables → Type All Fields from Functions**.
-4. Use **VTables → Navigate to Virtual Function** (or `Ctrl+Shift+V`) to jump from a call site to the dispatched target.
+2. Run **VTables -> Auto-Define for All Classes**. Wait for BN's analysis indicator to settle.
+3. If virtual calls still appear as raw pointer arithmetic, run **VTables -> Type All Fields from Functions**.
+4. Use **VTables -> Navigate to Virtual Function** (or `Ctrl+Shift+V`) to jump from a call site to the dispatched target.
 
 ### Recommended Keybindings
 
-Set in Settings → Keybindings (one-time per workstation):
+Set in Settings -> Keybindings (one-time per workstation):
 
 | Action | Suggested binding |
 |--------|------------------|
@@ -69,9 +69,9 @@ Recovers cross-references and indirect call targets that MSVC's XFG (eXtended Fl
 
 The XFG hash stored at `func_start - 8` has bit 0 set. Call sites load the same value with bit 0 cleared. Results may include type-hash aliases, which are other functions that share the same XFG type signature (identical prototype). Disambiguate by checking the vtable slot offset loaded into RAX before each `movabs r10`.
 
-All commands are under Plugins → XFG:
+All commands are under Plugins -> XFG:
 
-#### XFG → Cross-References
+#### XFG -> Cross-References
 
 Registers user code xrefs visible in BN's cross-references panel.
 
@@ -82,7 +82,7 @@ Registers user code xrefs visible in BN's cross-references panel.
 | `Add All` | Plugins menu | Scan entire binary and add every resolvable xref |
 | `Remove All` | Plugins menu | Remove all xrefs added by this plugin |
 
-#### XFG → Indirect Calls
+#### XFG -> Indirect Calls
 
 Registers indirect branch targets via `set_user_indirect_branches` and annotates the call site with an `XFG -> FuncName` comment so HLIL can resolve `(*(*ptr+N))(ptr)` patterns.
 
@@ -96,26 +96,22 @@ Registers indirect branch targets via `set_user_indirect_branches` and annotates
 | `Resolve All` | Plugins menu | Scan entire binary and resolve all XFG call sites |
 | `Remove All` | Plugins menu | Clear all targets and comments set by Resolve All |
 
-#### XFG → Reset Hash Map Cache
+#### XFG -> Reset Hash Map Cache
 
 Invalidates the cached function-to-hash map. Use after adding or removing functions mid-session. The cache also self-invalidates when a slow-path scan finds a target the cache was missing.
 
 ### Recommended XFG Workflow
 
-1. Run **XFG → Indirect Calls → Resolve All** to annotate every XFG-guarded call site in one pass. Each site gets an `XFG -> FuncName` comment and CFG edges to the target(s).
-2. Optionally run **XFG → Cross-References → Add All** to populate the xrefs panel.
+1. Run **XFG -> Indirect Calls -> Resolve All** to annotate every XFG-guarded call site in one pass. Each site gets an `XFG -> FuncName` comment and CFG edges to the target(s).
+2. Optionally run **XFG -> Cross-References -> Add All** to populate the xrefs panel.
 3. Use **Go to Target Here** (or `Shift+G`) to navigate from any XFG call site to its target while browsing.
 
 ### Recommended Keybindings
 
-Set in Settings → Keybindings (one-time per workstation):
+Set in Settings -> Keybindings (one-time per workstation):
 
 | Action | Suggested binding |
 |--------|------------------|
 | `XFG\Indirect Calls\Go to Target Here` | `Shift+G` |
 | `XFG\Indirect Calls\Resolve Here` | `Shift+R` |
 | `XFG\Cross-References\Find Here` | `Shift+X` |
-
-## binexport12_binaryninja.dll
-
-Pre-built [BinExport](https://github.com/google/binexport) plugin for Binary Ninja. Exports the open binary to BinExport format (`.BinExport`), which is consumed by tools like BinDiff for binary similarity analysis.
