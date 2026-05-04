@@ -246,9 +246,12 @@ def _create_vtable_struct(
 
     bv.define_user_type(struct_name, builder)
 
-    struct_type = bv.get_type_by_name(struct_name)
-    if struct_type is not None:
-        bv.define_user_data_var(vtable_addr, struct_type)
+    # Stamp the data variable with a NamedTypeReference rather than the inline
+    # StructureType so that BN's xref propagation and "Create All Members for
+    # Structure" command (which key off NamedTypeReferenceType) keep working.
+    if bv.get_type_by_name(struct_name) is not None:
+        nt = Type.named_type_from_registered_type(bv, struct_name)
+        bv.define_user_data_var(vtable_addr, nt)
 
     log_info(
         f"vtable_autodefine: defined {struct_name} ({n_slots} slots) @ {vtable_addr:#x}"
@@ -398,13 +401,12 @@ def _update_class_struct(bv: BinaryView, class_name: str, vtable_info: list) -> 
     """
     resolved: list[tuple] = []
     for vtable_addr, iface_name, struct_name, class_offset in vtable_info:
-        vtable_type = bv.get_type_by_name(struct_name)
-        if vtable_type is None:
+        if bv.get_type_by_name(struct_name) is None:
             log_warn(
                 f"vtable_autodefine: type '{struct_name}' not found, skipping field in {class_name}"
             )
             continue
-        resolved.append((class_offset, iface_name, vtable_type))
+        resolved.append((class_offset, iface_name, struct_name))
 
     if not resolved:
         return
@@ -425,8 +427,9 @@ def _update_class_struct(bv: BinaryView, class_name: str, vtable_info: list) -> 
                 continue
             builder.add_member_at_offset(m.name, m.type, m.offset)
 
-    for class_offset, iface_name, vtable_type in resolved:
-        ptr_type = Type.pointer(bv.arch, vtable_type)
+    for class_offset, iface_name, struct_name in resolved:
+        nt = Type.named_type_from_registered_type(bv, struct_name)
+        ptr_type = Type.pointer(bv.arch, nt)
         if class_offset == 0:
             field_name = "vtable"
         else:
@@ -449,8 +452,7 @@ def _update_interface_struct(bv: BinaryView, iface_name: str, struct_name: str) 
     any function that receives IFulfillmentDataInfo* shows raw '(*(*ptr + N))(ptr)'
     even though FulfillmentDataInfo already has the vtable field defined.
     """
-    vtable_type = bv.get_type_by_name(struct_name)
-    if vtable_type is None:
+    if bv.get_type_by_name(struct_name) is None:
         return
 
     clean_iface = _strip_elaborated_type_keywords(iface_name)
@@ -466,7 +468,8 @@ def _update_interface_struct(bv: BinaryView, iface_name: str, struct_name: str) 
                 continue  # will be replaced with our typed vtable pointer
             builder.add_member_at_offset(m.name, m.type, m.offset)
 
-    ptr_type = Type.pointer(bv.arch, vtable_type)
+    nt = Type.named_type_from_registered_type(bv, struct_name)
+    ptr_type = Type.pointer(bv.arch, nt)
     builder.add_member_at_offset("vtable", ptr_type, 0)
     bv.define_user_type(clean_iface, builder)
     log_info(f"vtable_autodefine: added vtable field to interface {clean_iface}")
@@ -510,11 +513,11 @@ def _update_constructor_this_types(
     required for field-access promotion to fire.
     Returns the set of retyped Function objects.
     """
-    struct_type = bv.get_type_by_name(class_name)
-    if struct_type is None:
+    if bv.get_type_by_name(class_name) is None:
         return set()
 
-    ptr_type = Type.pointer(bv.arch, struct_type)
+    nt = Type.named_type_from_registered_type(bv, class_name)
+    ptr_type = Type.pointer(bv.arch, nt)
     updated: set = set()
     class_prefix = class_name + "::"
 
@@ -562,10 +565,10 @@ def _update_vtable_method_this_types(
     HLIL lifting picks up the new type and promotes field accesses.
     Returns the set of retyped Function objects.
     """
-    struct_type = bv.get_type_by_name(class_name)
-    if struct_type is None:
+    if bv.get_type_by_name(class_name) is None:
         return set()
-    ptr_type = Type.pointer(bv.arch, struct_type)
+    nt = Type.named_type_from_registered_type(bv, class_name)
+    ptr_type = Type.pointer(bv.arch, nt)
     updated: set = set()
 
     for vtable_addr, iface_name, struct_name, class_offset in vtable_info:
@@ -752,9 +755,10 @@ def _process_class(
         # shows as ClassName*.  create_user_var forces a full HLIL re-lift on
         # each caller and triggers SSA copy splitting so field promotion fires
         # on the typed copy.
-        struct_type = bv.get_type_by_name(class_name)
         ptr_to_class = (
-            Type.pointer(bv.arch, struct_type) if struct_type is not None else None
+            Type.pointer(bv.arch, Type.named_type_from_registered_type(bv, class_name))
+            if bv.get_type_by_name(class_name) is not None
+            else None
         )
         for ctor in ctor_funcs:
             for ref in bv.get_code_refs(ctor.start):
@@ -800,6 +804,51 @@ def _class_name_from_func(fname: str, vtable_map: dict) -> str | None:
     return None
 
 
+def _auto_populate_class_struct(bv: BinaryView, class_name: str) -> bool:
+    """Run BN's "Create All Members for Structure" equivalent on the named class.
+
+    Calls bv.create_structure_from_offset_access (the public Python API behind the
+    'S' UI command, see ui/commands.h:createStructMembers ->
+    BNCreateStructureFromOffsetAccess) to infer field types from observed accesses
+    through any pointer typed as a NamedTypeReference to class_name, then re-
+    registers the result.  This is what makes class struct fields appear at the
+    offsets HLIL was previously rendering as `__offset(N).d`.
+
+    Defensive: refuses to re-define if the inferred struct would drop any of the
+    existing members (vtable pointers in particular), since that would be a
+    regression rather than an improvement.
+
+    Returns True if the struct was populated (one or more new members added).
+    """
+    try:
+        existing = bv.get_type_by_name(class_name)
+        if existing is None or existing.type_class != TypeClass.StructureTypeClass:
+            return False
+        existing_offsets = {m.offset for m in existing.members}
+        new_struct = bv.create_structure_from_offset_access(class_name)
+        new_offsets = {m.offset for m in new_struct.members}
+
+        if not existing_offsets.issubset(new_offsets):
+            log_warn(
+                f"vtable_autodefine: auto-populate would drop existing fields in "
+                f"{class_name}, skipping (existing={sorted(existing_offsets)} "
+                f"new={sorted(new_offsets)})"
+            )
+            return False
+        added = new_offsets - existing_offsets
+        if not added:
+            return False
+        bv.define_user_type(class_name, new_struct)
+        log_info(
+            f"vtable_autodefine: auto-populated {class_name} (+{len(added)} field(s) "
+            f"from observed accesses)"
+        )
+        return True
+    except Exception as e:
+        log_warn(f"vtable_autodefine: auto-populate failed for {class_name}: {e}")
+        return False
+
+
 def _do_process_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
     """Background worker for Auto-Define Vtable Structs for All Classes."""
     task.progress = "VTables: scanning for RTTI vtable symbols..."
@@ -837,15 +886,34 @@ def _do_process_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
 
     bv.commit_undo_actions()
 
-    if all_funcs:
-        bv.update_analysis()
+    populated = 0
+    if all_funcs and not task.cancelled:
+        # Block until the retypes above have re-lifted HLIL, otherwise
+        # create_structure_from_offset_access sees no observed accesses through
+        # the new typed `this` pointer and returns an empty struct.
+        task.progress = "VTables: waiting for analysis to settle..."
+        bv.update_analysis_and_wait()
         log_info(
             f"vtable_autodefine: queued re-analysis for {len(all_funcs)} function(s)"
         )
 
+        # Programmatic equivalent of the user pressing 'S' on every class —
+        # ask BN to infer struct fields from the now-typed accesses through `this`.
+        bv.begin_undo_actions()
+        for i, class_name in enumerate(sorted(vtable_map.keys()), 1):
+            if task.cancelled:
+                break
+            task.progress = f"VTables: auto-populating {i}/{total_classes} - {class_name}"
+            if _auto_populate_class_struct(bv, class_name):
+                populated += 1
+        bv.commit_undo_actions()
+        if populated:
+            bv.update_analysis()
+
     show_message_box(
         "Auto-Define Vtable Structs",
-        f"Processed {total_classes} class(es), {total_structs} vtable struct(s)"
+        f"Processed {total_classes} class(es), {total_structs} vtable struct(s), "
+        f"auto-populated {populated} class struct(s)"
         f"{' (cancelled)' if task.cancelled else ''}.\n\n"
         "Re-analysis queued - wait for BN's analysis indicator to finish,\n"
         "then check HLIL for promoted vtable field accesses.",
@@ -899,9 +967,20 @@ def _do_process_for_address(bv: BinaryView, addr: int, task: BackgroundTaskThrea
     for func in funcs_set:
         func.mark_caller_updates_required(FunctionUpdateType.UserFunctionUpdate)
     bv.commit_undo_actions()
-    if funcs_set:
-        bv.update_analysis()
-    show_message_box("Auto-Define Vtable Structs", msg)
+
+    populated = False
+    if funcs_set and not task.cancelled:
+        task.progress = "VTables: waiting for analysis to settle..."
+        bv.update_analysis_and_wait()
+        task.progress = f"VTables: auto-populating {class_name}"
+        bv.begin_undo_actions()
+        populated = _auto_populate_class_struct(bv, class_name)
+        bv.commit_undo_actions()
+        if populated:
+            bv.update_analysis()
+
+    suffix = " (auto-populated class struct)" if populated else ""
+    show_message_box("Auto-Define Vtable Structs", msg + suffix)
 
 
 def _cmd_process_for_address(bv: BinaryView, addr: int) -> None:
@@ -1112,9 +1191,17 @@ def _get_calling_class(bv: BinaryView, addr: int, vtable_map: dict) -> str | Non
         return None
     name = funcs[0].name
     if name.startswith("?"):
+        # demangle_ms returns either a list of qualified-name parts or a flat
+        # string depending on the symbol shape (templates, nested types, etc.).
+        # Without the list branch the caller silently keeps the raw mangled
+        # name and prefix matching against vtable_map keys never fires —
+        # exactly the failure mode that masked WRL template glue from XFG
+        # disambiguation.
         try:
             _, parts = demangle_ms(bv.arch, name)
-            if isinstance(parts, str):
+            if isinstance(parts, list):
+                name = "::".join(parts)
+            elif isinstance(parts, str):
                 name = parts
         except Exception:
             pass
@@ -1216,7 +1303,7 @@ def _cmd_navigate_to_virtual(bv: BinaryView, addr: int) -> None:
         for fp, name, sname, _ in candidates
     ]
     idx = get_choice_input(
-        "Navigate to Virtual Function", "Multiple candidates:", choices
+        "Multiple candidates:", "Navigate to Virtual Function", choices
     )
     if idx is not None:
         bv.file.navigate(bv.file.view, candidates[idx][0])

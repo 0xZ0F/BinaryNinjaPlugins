@@ -85,6 +85,12 @@ def _type_vtable_at(
             updated_members.append(member)
             continue
 
+        if not ft.can_return:
+            # Virtual overrides can return normally — don't let one noreturn
+            # implementation (purecall stubs, throw-only overrides, ud2 traps)
+            # poison every call through this slot.
+            ft = Type.function(ft.return_value, list(ft.parameters), ft.calling_convention)
+
         fp_type = Type.pointer(bv.arch, ft)
         updated_members.append(StructureMember(fp_type, member.name, member.offset))
         updated_funcs.add(func)

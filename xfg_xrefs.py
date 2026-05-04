@@ -52,17 +52,26 @@ register hotkeys directly, so this is a manual one-time step per workstation):
 Install: copy to %APPDATA%\\Binary Ninja\\plugins\\
 """
 
+import json as _json
+
 from binaryninja import BinaryView, Function, PluginCommand, log_info
 from binaryninja.enums import (
     MessageBoxButtonSet,
     MessageBoxButtonResult,
     MessageBoxIcon,
+    TypeClass,
 )
 from binaryninja.interaction import (
     show_message_box,
     get_choice_input,
 )
 from binaryninja.plugin import BackgroundTaskThread
+
+try:
+    from binaryninja import Settings as _Settings
+    _bn_settings = _Settings()
+except Exception:
+    _bn_settings = None
 
 
 def _check_arch(bv: BinaryView, title: str) -> bool:
@@ -149,9 +158,10 @@ def _get_hash_map(bv: BinaryView) -> dict:
 
 
 def _reset_hash_map(bv: BinaryView) -> None:
-    """Invalidate the cached XFG hash map for bv."""
+    """Invalidate the cached XFG hash map and vtable disambiguation context for bv."""
     bv.session_data.pop(_HASH_MAP_KEY, None)
-    log_info("xfg_xrefs: hash map cache cleared")
+    bv.session_data.pop(_VTABLE_DISAMBIG_KEY, None)
+    log_info("xfg_xrefs: hash map and vtable disambig caches cleared")
 
 
 def _record_slow_path_hit(bv: BinaryView, func_hash: int, target_addrs: list) -> None:
@@ -165,6 +175,359 @@ def _record_slow_path_hit(bv: BinaryView, func_hash: int, target_addrs: list) ->
     if cached is None:
         return
     cached[func_hash] = list(target_addrs)
+
+
+# XFG hashes are type-prototype hashes, so every function with the same C++
+# prototype (e.g. every IUnknown::Release override) shares one hash.  Adding
+# an xref / indirect branch from each call site to *every* alias makes 199 of
+# 200 entries false positives at any given site, multiplies the BNDB metadata
+# size by the alias count, and is the dominant driver of save time, RAM usage,
+# and tab-switch latency on RTTI-rich binaries.
+#
+# Strategy (configurable via BN Settings, see _register_settings below):
+#   1. If <= 1 target: trivial, write it.
+#   2. Try to narrow to the actual concrete target via vtable dispatch
+#      analysis (slot_off + class_off + typed `this`).  Works inside RTTI
+#      class methods whose `this` is typed.  Collapses 200 aliases to 1.
+#   3. If narrowing fails and target count <= alias threshold: keep current
+#      behavior (small fan-out is tolerable; BN handles it cleanly).
+#   4. If narrowing fails and target count > alias threshold: write nothing.
+#      The "XFG -> ..." comment still records the alias family for the user.
+#
+# The `metadataMode` setting overlays this with a stricter / more permissive
+# write policy:
+#   - "narrowed"      : full strategy above (default)
+#   - "disambig_only" : only write metadata when narrowing collapsed the
+#                       alias set to a single concrete target.  Recommended
+#                       for large RTTI-rich binaries — this is where the
+#                       indirect-branch CFG cascade dominates analysis cost.
+#   - "none"          : never write xrefs / indirect branches; comments only.
+#                       Maximum perf; navigation via 'Go to Target Here'.
+
+_S_ALIAS_THRESHOLD = "xfg_xrefs.aliasThreshold"
+_S_METADATA_MODE = "xfg_xrefs.metadataMode"
+_DEFAULT_ALIAS_THRESHOLD = 16
+_DEFAULT_METADATA_MODE = "narrowed"
+_VALID_METADATA_MODES = ("narrowed", "disambig_only", "none")
+
+_VTABLE_DISAMBIG_KEY = "xfg_xrefs:vtable_disambig_ctx"
+
+
+def _register_settings() -> None:
+    """Register plugin settings with Binary Ninja's settings system.
+
+    Settings register at module import time.  Re-registering with the same
+    schema is a no-op; mismatched schemas raise, which is why each call is
+    wrapped in its own try/except — we don't want a stale cached schema from
+    an earlier plugin version to abort the rest of registration.
+    """
+    if _bn_settings is None:
+        return
+    try:
+        _bn_settings.register_group("xfg_xrefs", "XFG Xrefs")
+    except Exception:
+        pass
+    try:
+        _bn_settings.register_setting(_S_ALIAS_THRESHOLD, _json.dumps({
+            "title": "XFG Alias Threshold",
+            "type": "number",
+            "default": _DEFAULT_ALIAS_THRESHOLD,
+            "minValue": 1,
+            "maxValue": 1024,
+            "description": (
+                "Maximum number of XFG hash aliases before a call site falls back "
+                "to comment-only.  Hashes with more aliases than this skip xrefs "
+                "and indirect branches to reduce BNDB metadata bloat.  Lower "
+                "values produce smaller databases at the cost of less complete "
+                "cross-reference coverage on small fan-out hashes."
+            ),
+        }))
+    except Exception:
+        pass
+    try:
+        _bn_settings.register_setting(_S_METADATA_MODE, _json.dumps({
+            "title": "XFG Metadata Write Mode",
+            "type": "string",
+            "default": _DEFAULT_METADATA_MODE,
+            "enum": list(_VALID_METADATA_MODES),
+            "enumDescriptions": [
+                "Write metadata to all narrowed targets up to alias threshold (balanced default).",
+                "Only write metadata when disambiguation collapsed the alias set to a single concrete target.",
+                "Never write xrefs or indirect branches; comments only.  Maximum perf; navigation via 'Go to Target Here'.",
+            ],
+            "description": (
+                "Controls when 'Resolve' / 'Add' commands write user xrefs and "
+                "indirect branch targets.  'disambig_only' is the recommended "
+                "setting for large RTTI-rich binaries where the indirect-branch "
+                "CFG cascade dominates analysis cost."
+            ),
+        }))
+    except Exception:
+        pass
+
+
+def _get_alias_threshold() -> int:
+    if _bn_settings is None:
+        return _DEFAULT_ALIAS_THRESHOLD
+    try:
+        v = _bn_settings.get_integer(_S_ALIAS_THRESHOLD)
+        return v if isinstance(v, int) and v > 0 else _DEFAULT_ALIAS_THRESHOLD
+    except Exception:
+        return _DEFAULT_ALIAS_THRESHOLD
+
+
+def _get_metadata_mode() -> str:
+    if _bn_settings is None:
+        return _DEFAULT_METADATA_MODE
+    try:
+        m = _bn_settings.get_string(_S_METADATA_MODE)
+        return m if m in _VALID_METADATA_MODES else _DEFAULT_METADATA_MODE
+    except Exception:
+        return _DEFAULT_METADATA_MODE
+
+
+_register_settings()
+
+
+def _get_vtable_disambig_ctx(bv: BinaryView):
+    """Return a context for vtable-based XFG target disambiguation, or None.
+
+    Soft-imports vtable_autodefine — both plugins live in the same plugins/
+    directory and BN loads them as top-level modules.  Returns None (cached as
+    False) when vtable_autodefine isn't loaded or the binary has no RTTI vtable
+    symbols, in which case _narrow_targets falls back to the threshold cap.
+    """
+    cached = bv.session_data.get(_VTABLE_DISAMBIG_KEY)
+    if cached is not None:
+        return cached if cached is not False else None
+    try:
+        import vtable_autodefine as vad  # type: ignore
+    except Exception:
+        bv.session_data[_VTABLE_DISAMBIG_KEY] = False
+        return None
+    try:
+        vtable_map = vad._find_vtable_symbols(bv)
+    except Exception:
+        bv.session_data[_VTABLE_DISAMBIG_KEY] = False
+        return None
+    if not vtable_map:
+        bv.session_data[_VTABLE_DISAMBIG_KEY] = False
+        return None
+    ctx = {"vad": vad, "vtable_map": vtable_map}
+    bv.session_data[_VTABLE_DISAMBIG_KEY] = ctx
+    return ctx
+
+
+def _class_from_pointed_type(target, vtable_map: dict) -> str | None:
+    """Return the vtable_map key for the type a pointer targets, else None.
+
+    Accepts both NamedTypeReference (typical after vtable_autodefine retypes
+    function prototypes) and inline StructureType with a registered_name
+    (rarer; happens when types were stamped without going through a named ref).
+    """
+    if target is None:
+        return None
+    try:
+        if target.type_class == TypeClass.NamedTypeReferenceClass:
+            name = str(target.name)
+            return name if name in vtable_map else None
+        if target.type_class == TypeClass.StructureTypeClass:
+            reg = getattr(target, "registered_name", None)
+            if reg:
+                name = str(reg)
+                return name if name in vtable_map else None
+    except Exception:
+        return None
+    return None
+
+
+def _calling_class_from_call_first_arg(
+    bv: BinaryView, call_addr: int, vtable_map: dict
+) -> str | None:
+    """Tier-2 fallback: derive the class from the type of the call's first argument.
+
+    On x86_64 fastcall the first argument is the dispatched object — for a
+    virtual call `obj->Method(args...)`, MLIL renders it as `Method(obj, args)`
+    with `obj` as params[0].  This handles the common case where the calling
+    function itself is *not* a method of an RTTI class (free functions, helpers,
+    WRL template glue) but the dispatched object IS typed as a registered
+    struct, e.g. `m_completedHandler->Invoke(...)` where m_completedHandler is
+    typed as a named-ref to ICompletedHandler.
+
+    Note this only succeeds when the dispatched object's static type is itself
+    a class with an RTTI vtable in vtable_map.  Calls through abstract
+    interfaces with no concrete vtable symbol (most pure-COM IFoo*) still fall
+    through to comment-only.
+    """
+    funcs = bv.get_functions_containing(call_addr)
+    if not funcs:
+        return None
+    func = funcs[0]
+    try:
+        mlil_insn = func.get_medium_level_il_at(call_addr)
+    except Exception:
+        return None
+    if mlil_insn is None:
+        return None
+
+    # MLIL_CALL / MLIL_TAILCALL / MLIL_CALL_UNTYPED all expose .params; pull
+    # them defensively since the exact operation set differs across BN
+    # versions.  An empty params list (e.g. niladic call) means we can't help.
+    params = None
+    try:
+        params = list(mlil_insn.params)
+    except Exception:
+        return None
+    if not params:
+        return None
+
+    first = params[0]
+    et = None
+    try:
+        et = first.expr_type
+    except Exception:
+        et = None
+    if et is None:
+        # Some MLIL forms expose the underlying variable directly; fall back to
+        # the variable's declared type when expr_type isn't populated.
+        try:
+            et = first.var.type
+        except Exception:
+            et = None
+    if et is None:
+        return None
+    try:
+        if et.type_class != TypeClass.PointerTypeClass:
+            return None
+    except Exception:
+        return None
+    return _class_from_pointed_type(et.target, vtable_map)
+
+
+def _try_vtable_disambig(
+    bv: BinaryView, movabs_addr: int, targets: list, ctx
+) -> list | None:
+    """Resolve XFG aliases to a concrete single target via vtable dispatch.
+
+    Returns [fp_addr] on success, or None if the call can't be narrowed (no
+    vtable context, non-vtable dispatch shape, no class match, fp not in
+    alias set, etc.).
+    """
+    if ctx is None:
+        return None
+    vad = ctx["vad"]
+    vtable_map = ctx["vtable_map"]
+
+    call_addr = _find_xfg_call(bv, movabs_addr)
+    if call_addr is None:
+        return None
+
+    try:
+        slot_offset, vtable_class_offset = vad._get_vtable_dispatch_info(bv, call_addr)
+    except Exception:
+        return None
+    if slot_offset is None:
+        return None
+
+    # Tier 1: function name → class via RTTI prefix match.
+    try:
+        calling_class = vad._get_calling_class(bv, call_addr, vtable_map)
+    except Exception:
+        calling_class = None
+
+    # Tier 2: type of the call's first MLIL argument (the dispatched object).
+    # Catches dispatches through member fields and through interface pointers
+    # in helper/free functions, where Tier 1 returns None.
+    if not calling_class or calling_class not in vtable_map:
+        calling_class = _calling_class_from_call_first_arg(bv, call_addr, vtable_map)
+    if not calling_class or calling_class not in vtable_map:
+        return None
+
+    class_addrs = [a for a, _ in vtable_map[calling_class]]
+    try:
+        cache = vad._offset_cache(bv)
+        missing = [a for a in class_addrs if a not in cache]
+        if missing:
+            for a, off in vad._find_class_offsets(bv, missing).items():
+                cache[a] = off
+    except Exception:
+        return None
+
+    matching_vtable = None
+    if vtable_class_offset is not None:
+        for a in class_addrs:
+            if cache.get(a) == vtable_class_offset:
+                matching_vtable = a
+                break
+    elif len(class_addrs) == 1:
+        matching_vtable = class_addrs[0]
+    if matching_vtable is None:
+        return None
+
+    raw = bv.read(matching_vtable + slot_offset, 8)
+    if not raw or len(raw) < 8:
+        return None
+    fp_addr = int.from_bytes(raw, "little")
+    if fp_addr == 0 or fp_addr not in targets:
+        return None
+    return [fp_addr]
+
+
+def _narrow_targets(
+    bv: BinaryView, movabs_addr: int, targets: list, ctx
+) -> list | None:
+    """Reduce alias-rich XFG target lists via vtable dispatch or threshold cap.
+
+    Returns:
+      * list[int] - targets to write metadata (xrefs / indirect branches) for
+      * None      - alias-rich and undisambiguable; caller should write the
+                    'XFG ->' comment but skip metadata to avoid BNDB bloat
+    """
+    if len(targets) <= 1:
+        return list(targets)
+    narrowed = _try_vtable_disambig(bv, movabs_addr, targets, ctx)
+    if narrowed is not None:
+        return narrowed
+    if len(targets) <= _get_alias_threshold():
+        return list(targets)
+    return None
+
+
+def _final_targets_to_write(
+    bv: BinaryView, movabs_addr: int, targets: list, ctx, mode: str | None = None
+) -> tuple[list, str]:
+    """Apply alias threshold + metadata mode and return what should be written.
+
+    Returns (targets_to_write, status):
+      * status "ok"               - len>0, len(targets) <= 1 OR not a disambig case
+      * status "ok-disambig"      - narrowed from many aliases to a single concrete
+      * status "skip-mode-none"   - mode=none, write nothing
+      * status "skip-alias"       - alias-rich and undisambiguable
+      * status "skip-not-disambig"- mode=disambig_only and we couldn't narrow to 1
+
+    Centralising the decision here keeps `_resolve_one_xfg_site`, `_do_add_all`,
+    and `_run_for_func` consistent with each other and with the BN settings.
+    """
+    if mode is None:
+        mode = _get_metadata_mode()
+    if mode == "none":
+        return [], "skip-mode-none"
+
+    narrowed = _narrow_targets(bv, movabs_addr, targets, ctx)
+    if narrowed is None:
+        return [], "skip-alias"
+
+    # "High confidence" means we know exactly one concrete target — either the
+    # hash had one alias to begin with (trivial) or vtable disambig collapsed a
+    # multi-alias set down to one.  `disambig_only` mode includes both: a
+    # 1-alias hash is the highest-confidence case there is, and excluding it
+    # would silently drop ~all single-target XFG calls from indirect-branch
+    # metadata for no perf benefit.
+    is_disambig = len(targets) > 1 and len(narrowed) == 1
+    if mode == "disambig_only" and len(narrowed) > 1:
+        return [], "skip-not-disambig"
+
+    return narrowed, "ok-disambig" if is_disambig else "ok"
 
 
 def _search_pattern(bv: BinaryView, call_hash: int) -> list[int]:
@@ -331,19 +694,46 @@ def _run_for_func(bv: BinaryView, func_start: int, func_name: str) -> None:
         )
         return
 
+    # Use _find_targets_for_hash so per-site narrowing can decide whether this
+    # site's call actually dispatches to func_start vs another alias.
+    hash_map = _get_hash_map(bv)
+    targets = _find_targets_for_hash(bv, call_hash, hash_map)
+    ctx = _get_vtable_disambig_ctx(bv)
+    mode = _get_metadata_mode()
+
     bv.begin_undo_actions()
     added = 0
     skipped = 0
+    skipped_by_mode: dict[str, int] = {}
+    skipped_other_alias = 0  # narrowing identified a different alias as the target
     for site in sorted(hits):
+        write_targets, write_status = _final_targets_to_write(
+            bv, site, targets, ctx, mode
+        )
+        if not write_targets:
+            skipped_by_mode[write_status] = skipped_by_mode.get(write_status, 0) + 1
+            continue
+        if func_start not in write_targets:
+            skipped_other_alias += 1
+            continue
         if _add_xref(bv, site, func_start):
             added += 1
         else:
             skipped += 1
     bv.commit_undo_actions()
-    log_info(
-        f"xfg_xrefs: {func_name} - {added} xref(s) added"
-        + (f", {skipped} skipped (call site not in function)" if skipped else "")
-    )
+    parts = [f"{added} xref(s) added"]
+    if skipped:
+        parts.append(f"{skipped} skipped (call site not in function)")
+    if skipped_other_alias:
+        parts.append(f"{skipped_other_alias} skipped (narrowed to a different alias)")
+    skipped_alias = skipped_by_mode.get("skip-alias", 0)
+    if skipped_alias:
+        parts.append(f"{skipped_alias} skipped (>{_get_alias_threshold()} aliases, no vtable disambig)")
+    if skipped_by_mode.get("skip-mode-none", 0):
+        parts.append(f"{skipped_by_mode['skip-mode-none']} skipped (mode=none)")
+    if skipped_by_mode.get("skip-not-disambig", 0):
+        parts.append(f"{skipped_by_mode['skip-not-disambig']} skipped (mode=disambig_only, not unique)")
+    log_info(f"xfg_xrefs: {func_name} (mode={mode}) - " + ", ".join(parts))
 
 
 def _cmd_for_address(bv: BinaryView, addr: int) -> None:
@@ -378,9 +768,12 @@ def _do_add_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
         f"xfg_xrefs: found {len(hash_map)} unique XFG hashes across {sum(len(v) for v in hash_map.values())} function(s)"
     )
 
+    ctx = _get_vtable_disambig_ctx(bv)
     bv.begin_undo_actions()
     added = 0
     skipped = 0
+    skipped_by_mode: dict[str, int] = {}
+    disambiguated = 0
     sites = 0
     addr = bv.start
 
@@ -401,26 +794,50 @@ def _do_add_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
 
         targets = hash_map.get(func_hash)
         if targets:
-            for target in targets:
-                if _add_xref(bv, found, target):
-                    added += 1
-                else:
-                    skipped += 1
+            write_targets, write_status = _final_targets_to_write(
+                bv, found, targets, ctx
+            )
+            if not write_targets:
+                skipped_by_mode[write_status] = skipped_by_mode.get(write_status, 0) + 1
+            else:
+                if write_status == "ok-disambig":
+                    disambiguated += 1
+                for target in write_targets:
+                    if _add_xref(bv, found, target):
+                        added += 1
+                    else:
+                        skipped += 1
 
         sites += 1
         if sites % 64 == 0:
-            task.progress = f"XFG: scanning sites... {sites} found, {added} xrefs added"
+            task.progress = (
+                f"XFG: scanning sites... {sites} found, "
+                f"{added} xrefs added, {disambiguated} disambig"
+            )
         addr = found + _PATTERN_LEN
 
     bv.commit_undo_actions()
+    skipped_alias = skipped_by_mode.get("skip-alias", 0)
+    skipped_mode_none = skipped_by_mode.get("skip-mode-none", 0)
+    skipped_not_disambig = skipped_by_mode.get("skip-not-disambig", 0)
+    mode = _get_metadata_mode()
     log_info(
-        f"xfg_xrefs: done - {added} xref(s) added, {skipped} skipped (call site not in any function)"
+        f"xfg_xrefs: done (mode={mode}) - {added} xref(s) added, "
+        f"{disambiguated} site(s) disambiguated to 1, "
+        f"{skipped_alias} skipped (alias-rich), "
+        f"{skipped_mode_none} skipped (mode=none), "
+        f"{skipped_not_disambig} skipped (mode=disambig_only, not unique), "
+        f"{skipped} skipped (call site not in any function)"
     )
     show_message_box(
         "Add All XFG Xrefs",
-        f"Scan complete{' (cancelled)' if task.cancelled else ''}.\n\n"
-        f"  Xrefs added : {added}\n"
-        f"  Skipped     : {skipped} (call site not inside any function)\n\n"
+        f"Scan complete (mode={mode}){' (cancelled)' if task.cancelled else ''}.\n\n"
+        f"  Xrefs added            : {added}\n"
+        f"  Disambiguated to 1     : {disambiguated}\n"
+        f"  Skipped (alias-rich)   : {skipped_alias} (>{_get_alias_threshold()} aliases, no vtable disambig)\n"
+        f"  Skipped (mode=none)    : {skipped_mode_none}\n"
+        f"  Skipped (need disambig): {skipped_not_disambig}\n"
+        f"  Skipped (no func)      : {skipped}\n\n"
         "Added xrefs are visible in the cross-references panel and can be\n"
         "undone via Edit -> Undo.",
     )
@@ -521,13 +938,17 @@ def _comment_for_targets(bv: BinaryView, targets: list[int]) -> str:
 
 
 def _resolve_one_xfg_site(
-    bv: BinaryView, movabs_addr: int, hash_map: dict
+    bv: BinaryView, movabs_addr: int, hash_map: dict, ctx=None
 ) -> tuple[str, str]:
     """Apply XFG branch targets and 'XFG -> ...' comment at one movabs r10 site.
 
     Returns (status, comment) where status is one of:
-        "resolved", "no-targets", "no-call", "no-func"
-    Comment is the applied 'XFG -> ...' string when status is "resolved", else "".
+        "resolved", "resolved-disambig", "resolved-comment-only",
+        "no-targets", "no-call", "no-func"
+
+    "resolved-disambig"     : alias list narrowed to 1 concrete target via vtable
+    "resolved-comment-only" : alias-rich, no vtable disambig - comment only,
+                              no indirect branches written (avoids BNDB bloat)
     """
     hash_bytes = bv.read(movabs_addr + 2, 8)
     if not hash_bytes or len(hash_bytes) < 8:
@@ -542,9 +963,25 @@ def _resolve_one_xfg_site(
     funcs = bv.get_functions_containing(call_addr)
     if not funcs:
         return "no-func", ""
+    # Comment always reflects the full alias family so the user sees the
+    # prototype shape and total count, even when narrowing collapsed the
+    # indirect-branch list to a single concrete target.
     comment = _comment_for_targets(bv, targets)
-    funcs[0].set_user_indirect_branches(call_addr, [(bv.arch, t) for t in targets])
     bv.set_comment_at(call_addr, comment)
+
+    write_targets, write_status = _final_targets_to_write(
+        bv, movabs_addr, targets, ctx
+    )
+    if not write_targets:
+        # Skipped writing indirect branches: mode=none, alias-rich, or
+        # mode=disambig_only without a unique target.  All paths still keep
+        # the comment so the user can navigate via 'Go to Target Here'.
+        return "resolved-comment-only", comment
+    funcs[0].set_user_indirect_branches(
+        call_addr, [(bv.arch, t) for t in write_targets]
+    )
+    if write_status == "ok-disambig":
+        return "resolved-disambig", comment
     return "resolved", comment
 
 
@@ -620,8 +1057,11 @@ def _do_resolve_indirect_calls(bv: BinaryView, task: BackgroundTaskThread) -> No
         f"{sum(len(v) for v in hash_map.values())} function(s)"
     )
 
+    ctx = _get_vtable_disambig_ctx(bv)
     bv.begin_undo_actions()
     resolved = 0
+    disambig = 0
+    comment_only = 0
     skipped_no_call = 0
     skipped_no_func = 0
     sites = 0
@@ -634,9 +1074,14 @@ def _do_resolve_indirect_calls(bv: BinaryView, task: BackgroundTaskThread) -> No
         if found is None:
             break
 
-        status, _ = _resolve_one_xfg_site(bv, found, hash_map)
+        status, _ = _resolve_one_xfg_site(bv, found, hash_map, ctx)
         if status == "resolved":
             resolved += 1
+        elif status == "resolved-disambig":
+            disambig += 1
+            resolved += 1
+        elif status == "resolved-comment-only":
+            comment_only += 1
         elif status == "no-call":
             skipped_no_call += 1
         elif status == "no-func":
@@ -644,23 +1089,32 @@ def _do_resolve_indirect_calls(bv: BinaryView, task: BackgroundTaskThread) -> No
 
         sites += 1
         if sites % 32 == 0:
-            task.progress = f"XFG: resolving sites... {resolved}/{sites} resolved"
+            task.progress = (
+                f"XFG: resolving... {resolved}/{sites} resolved, "
+                f"{disambig} disambig, {comment_only} comment-only"
+            )
         addr = found + _PATTERN_LEN
 
     bv.commit_undo_actions()
     bv.update_analysis()
+    mode = _get_metadata_mode()
     log_info(
-        f"xfg_xrefs: indirect call resolution done - {resolved} site(s) resolved, "
-        f"{skipped_no_call} skipped (no XFG call found), {skipped_no_func} skipped (not in function)"
+        f"xfg_xrefs: indirect call resolution done (mode={mode}) - {resolved} site(s) resolved "
+        f"({disambig} disambiguated to 1 via vtable), {comment_only} comment-only, "
+        f"{skipped_no_call} skipped (no XFG call found), "
+        f"{skipped_no_func} skipped (not in function)"
     )
     show_message_box(
         "Resolve XFG Indirect Call Targets",
-        f"Scan complete{' (cancelled)' if task.cancelled else ''}.\n\n"
-        f"  Call sites resolved : {resolved}\n"
-        f"  Skipped (no call)   : {skipped_no_call}\n"
-        f"  Skipped (no func)   : {skipped_no_func}\n\n"
-        "Resolved call sites now have an 'XFG -> FuncName' comment in the decompiler\n"
-        "and CFG edges to the target(s) via set_user_indirect_branches.\n\n"
+        f"Scan complete (mode={mode}){' (cancelled)' if task.cancelled else ''}.\n\n"
+        f"  Resolved (full)       : {resolved}\n"
+        f"  -- of which disambig'd: {disambig} (alias-rich, narrowed to 1 via vtable)\n"
+        f"  Comment only          : {comment_only} (alias>{_get_alias_threshold()} or mode-restricted)\n"
+        f"  Skipped (no call)     : {skipped_no_call}\n"
+        f"  Skipped (no func)     : {skipped_no_func}\n\n"
+        "Resolved call sites have an 'XFG -> FuncName' comment in HLIL.  Sites with\n"
+        "indirect branch targets also show CFG edges; comment-only sites skip those\n"
+        "to avoid BNDB bloat / analysis cascade.  Adjust via Settings → XFG Xrefs.\n\n"
         "Undo via Edit -> Undo.",
     )
 
@@ -747,14 +1201,15 @@ def _cmd_resolve_here(bv: BinaryView, addr: int) -> None:
         return
     movabs_addr, call_addr = site
     hash_map = _get_hash_map(bv)
+    ctx = _get_vtable_disambig_ctx(bv)
 
     bv.begin_undo_actions()
-    status, comment = _resolve_one_xfg_site(bv, movabs_addr, hash_map)
+    status, comment = _resolve_one_xfg_site(bv, movabs_addr, hash_map, ctx)
     bv.commit_undo_actions()
     bv.update_analysis()
 
-    if status == "resolved" and call_addr is not None:
-        log_info(f"xfg_xrefs: resolved {call_addr:#x} (movabs @ {movabs_addr:#x}) - {comment}")
+    if status in ("resolved", "resolved-disambig", "resolved-comment-only") and call_addr is not None:
+        log_info(f"xfg_xrefs: {status} @ {call_addr:#x} (movabs @ {movabs_addr:#x}) - {comment}")
     elif status == "no-call":
         show_message_box(
             "Resolve XFG Call Target Here",
@@ -848,11 +1303,19 @@ def _cmd_goto_xfg_target(bv: BinaryView, addr: int) -> None:
         )
         return
 
-    if len(targets) == 1:
-        target = targets[0]
+    # Try vtable disambiguation first - on alias-rich hashes this collapses
+    # 200 candidates to the single function the call actually dispatches to.
+    # If narrowing returns None (alias-rich AND undisambiguable) we fall back
+    # to the full chooser since the user explicitly asked to navigate.
+    ctx = _get_vtable_disambig_ctx(bv)
+    narrowed = _try_vtable_disambig(bv, movabs_addr, targets, ctx)
+    nav_targets = narrowed if narrowed is not None else targets
+
+    if len(nav_targets) == 1:
+        target = nav_targets[0]
     else:
         labels: list[str] = []
-        for t in targets:
+        for t in nav_targets:
             f = bv.get_function_at(t)
             if f is None:
                 labels.append(f"<no function>  ({t:#x})")
@@ -867,7 +1330,7 @@ def _cmd_goto_xfg_target(bv: BinaryView, addr: int) -> None:
         )
         if choice is None:
             return
-        target = targets[choice]
+        target = nav_targets[choice]
 
     try:
         bv.file.navigate(bv.file.view, target)
@@ -890,8 +1353,11 @@ def _cmd_resolve_in_func(bv: BinaryView, func: Function) -> None:
         )
         return
 
+    ctx = _get_vtable_disambig_ctx(bv)
     bv.begin_undo_actions()
     resolved = 0
+    disambig = 0
+    comment_only = 0
     skipped_no_call = 0
     skipped_no_func = 0
     skipped_no_targets = 0
@@ -905,9 +1371,14 @@ def _cmd_resolve_in_func(bv: BinaryView, func: Function) -> None:
 
     for r in ranges:
         for movabs_addr, _call in _enumerate_xfg_sites_in_range(bv, r.start, r.end):
-            status, _ = _resolve_one_xfg_site(bv, movabs_addr, hash_map)
+            status, _ = _resolve_one_xfg_site(bv, movabs_addr, hash_map, ctx)
             if status == "resolved":
                 resolved += 1
+            elif status == "resolved-disambig":
+                disambig += 1
+                resolved += 1
+            elif status == "resolved-comment-only":
+                comment_only += 1
             elif status == "no-call":
                 skipped_no_call += 1
             elif status == "no-func":
@@ -917,16 +1388,20 @@ def _cmd_resolve_in_func(bv: BinaryView, func: Function) -> None:
 
     bv.commit_undo_actions()
     bv.update_analysis()
+    mode = _get_metadata_mode()
     log_info(
-        f"xfg_xrefs: resolved {resolved} XFG site(s) inside {func.name}"
+        f"xfg_xrefs: resolved {resolved} XFG site(s) inside {func.name} "
+        f"(mode={mode}, {disambig} via vtable disambig, {comment_only} comment-only)"
     )
     show_message_box(
         "Resolve XFG Call Targets in This Function",
-        f"Function: {func.name}\n\n"
-        f"  Resolved          : {resolved}\n"
-        f"  No call found     : {skipped_no_call}\n"
-        f"  Call not in func  : {skipped_no_func}\n"
-        f"  No matching hash  : {skipped_no_targets}\n\n"
+        f"Function: {func.name}  (mode={mode})\n\n"
+        f"  Resolved (full)       : {resolved}\n"
+        f"  -- of which disambig'd: {disambig}\n"
+        f"  Comment only          : {comment_only} (alias-rich or mode-restricted)\n"
+        f"  No call found         : {skipped_no_call}\n"
+        f"  Call not in func      : {skipped_no_func}\n"
+        f"  No matching hash      : {skipped_no_targets}\n\n"
         "Undo via Edit → Undo.",
     )
 
