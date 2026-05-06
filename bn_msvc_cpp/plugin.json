@@ -1,0 +1,14 @@
+{
+  "pluginmetadataversion": 2,
+  "name": "MSVC C++ Recovery",
+  "type": ["helper"],
+  "api": ["python3"],
+  "description": "Unified MSVC x86-64 RTTI / vtable / XFG recovery for Binary Ninja.",
+  "longdescription": "Consumes BN's bundled RTTI metadata, builds typed class graphs with proper inheritance via BaseStructures, enriches Class::VTable structs with typed function pointers, resolves XFG-guarded indirect calls, and cross-feeds XFG-resolved targets back into call-site `this` typing.",
+  "license": {"name": "MIT"},
+  "platforms": ["Windows", "Linux", "Darwin"],
+  "installinstructions": {"Windows": "Copy bn_msvc_cpp/ into %APPDATA%\\Binary Ninja\\plugins\\"},
+  "version": "0.1.0",
+  "author": "Z0F",
+  "minimumbinaryninjaversion": 4000
+}
