@@ -10,6 +10,7 @@ from binaryninja import (
 
 from ..rtti import ClassGraph
 from .classes import _attach_base_structures
+from .util import normalize_template_spacing, qn as _qn
 from .vtables import VtableScan
 
 
@@ -33,46 +34,27 @@ def discover_fields(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph) -
     raw offset arithmetic into named field references (including vtable slots).
     """
     accesses: Dict[str, Dict[int, int]] = {}
-    seen_targets: set[int] = set()
-    debug_budget = 0
-    walk_dump_budget = 0
     n_typed_funcs = 0
 
-    for scan in scans:
-        for slot in scan.slots:
-            if slot.target in seen_targets:
-                continue
-            seen_targets.add(slot.target)
-            func = bv.get_function_at(slot.target)
-            if func is None:
-                continue
-            params = func.parameter_vars
-            if params is None or len(params) == 0:
-                continue
-            this_var = params[0]
-            t = this_var.type
-            cls = _class_from_var_type(t)
-            if cls is None:
-                if debug_budget > 0 and t is not None:
-                    log.log_info(
-                        f"[MSVC C++] field-discovery: skipped fn {hex(slot.target)} "
-                        f"this_var.type repr={repr(t)[:120]} target={getattr(t, 'target', None)!r}"
-                    )
-                    debug_budget -= 1
-                continue
-            n_typed_funcs += 1
-            try:
-                mlil = func.medium_level_il
-            except Exception:
-                continue
-            if mlil is None:
-                continue
-            class_offsets = accesses.setdefault(cls, {})
-            if walk_dump_budget > 0:
-                walk_dump_budget -= 1
-                _dump_mlil(mlil, this_var, cls, slot.target)
-            for inst in mlil.instructions:
-                _walk_expr(inst, this_var, class_offsets)
+    for func in bv.functions:
+        params = func.parameter_vars
+        if params is None or len(params) == 0:
+            continue
+        this_var = params[0]
+        cls = _class_from_var_type(this_var.type)
+        if cls is None:
+            continue
+        n_typed_funcs += 1
+        try:
+            mlil = func.medium_level_il
+        except Exception:
+            continue
+        if mlil is None:
+            continue
+        aliases = _collect_var_aliases(mlil, this_var)
+        class_offsets = accesses.setdefault(cls, {})
+        for inst in mlil.instructions:
+            _walk_expr(inst, aliases, class_offsets)
     nonempty = sum(1 for v in accesses.values() if v)
     log.log_info(
         f"[MSVC C++] field-discovery: scanned {n_typed_funcs} typed functions, "
@@ -84,6 +66,11 @@ def discover_fields(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph) -
     for cls, off_widths in accesses.items():
         if not off_widths:
             continue
+        if "AsyncBase" in cls and "IAsyncActionCompletedHandler" in cls and "DisableCausality" in cls:
+            log.log_info(
+                f"[MSVC C++] field-discovery: AsyncBase observed offsets = "
+                + ", ".join(f"{o:#x}:w{w}" for o, w in sorted(off_widths.items()))
+            )
         added = _rebuild_class_with_fields(bv, cls, rtti, off_widths)
         if added > 0:
             n_added += added
@@ -143,22 +130,22 @@ def _clean_type_name(raw: str) -> Optional[str]:
         return None
     if s.endswith("::VTable") or "::VTable_for_" in s:
         return None
-    return s
+    return normalize_template_spacing(s)
 
 
-def _walk_expr(expr, this_var, offsets: Dict[int, int]) -> None:
+def _walk_expr(expr, aliases: set, offsets: Dict[int, int]) -> None:
     if expr is None or not hasattr(expr, "operation"):
         return
     op = _op(expr)
 
     if op in _LOAD_OPS:
-        offset = _check_this_address(getattr(expr, "src", None), this_var)
+        offset = _check_this_address(getattr(expr, "src", None), aliases)
         if offset is not None and offset > 0:
             size = int(getattr(expr, "size", 0) or 0)
             if size > 0:
                 offsets[offset] = max(offsets.get(offset, 0), size)
     elif op in _LOAD_STRUCT_OPS:
-        base_offset = _check_this_address(getattr(expr, "src", None), this_var)
+        base_offset = _check_this_address(getattr(expr, "src", None), aliases)
         if base_offset is not None:
             field_off = int(getattr(expr, "offset", 0) or 0)
             actual = base_offset + field_off
@@ -166,13 +153,13 @@ def _walk_expr(expr, this_var, offsets: Dict[int, int]) -> None:
             if size > 0 and actual > 0:
                 offsets[actual] = max(offsets.get(actual, 0), size)
     elif op in _STORE_OPS:
-        offset = _check_this_address(getattr(expr, "dest", None), this_var)
+        offset = _check_this_address(getattr(expr, "dest", None), aliases)
         if offset is not None and offset > 0:
             size = int(getattr(expr, "size", 0) or 0)
             if size > 0:
                 offsets[offset] = max(offsets.get(offset, 0), size)
     elif op in _STORE_STRUCT_OPS:
-        base_offset = _check_this_address(getattr(expr, "dest", None), this_var)
+        base_offset = _check_this_address(getattr(expr, "dest", None), aliases)
         if base_offset is not None:
             field_off = int(getattr(expr, "offset", 0) or 0)
             actual = base_offset + field_off
@@ -182,15 +169,15 @@ def _walk_expr(expr, this_var, offsets: Dict[int, int]) -> None:
 
     for operand in getattr(expr, "operands", []) or []:
         if hasattr(operand, "operation"):
-            _walk_expr(operand, this_var, offsets)
+            _walk_expr(operand, aliases, offsets)
 
 
-def _check_this_address(addr_expr, this_var) -> Optional[int]:
+def _check_this_address(addr_expr, aliases: set) -> Optional[int]:
     if addr_expr is None or not hasattr(addr_expr, "operation"):
         return None
     op = _op(addr_expr)
     if op in _VAR_OPS:
-        if _vars_eq(_expr_var(addr_expr), this_var):
+        if _var_key(_expr_var(addr_expr)) in aliases:
             return 0
         return None
     if op == "MLIL_ADD":
@@ -198,11 +185,51 @@ def _check_this_address(addr_expr, this_var) -> Optional[int]:
         right = getattr(addr_expr, "right", None)
         if left is None or right is None:
             return None
-        if _op(right) == "MLIL_CONST" and _vars_eq(_expr_var(left), this_var):
+        if _op(right) == "MLIL_CONST" and _var_key(_expr_var(left)) in aliases:
             return int(getattr(right, "constant", 0) or 0)
-        if _op(left) == "MLIL_CONST" and _vars_eq(_expr_var(right), this_var):
+        if _op(left) == "MLIL_CONST" and _var_key(_expr_var(right)) in aliases:
             return int(getattr(left, "constant", 0) or 0)
     return None
+
+
+def _var_key(var):
+    if var is None:
+        return None
+    return (
+        getattr(getattr(var, "source_type", None), "name", None),
+        getattr(var, "index", None),
+        getattr(var, "storage", None),
+    )
+
+
+def _collect_var_aliases(mlil, this_var) -> set:
+    """Find vars that are direct or transitive copies of this_var via SET_VAR."""
+    edges: dict = {}
+    for inst in mlil.instructions:
+        if _op(inst) != "MLIL_SET_VAR":
+            continue
+        src = getattr(inst, "src", None)
+        if src is None or _op(src) not in _VAR_OPS:
+            continue
+        src_var = _expr_var(src)
+        dest_var = getattr(inst, "dest", None)
+        if src_var is None or dest_var is None:
+            continue
+        sk, dk = _var_key(src_var), _var_key(dest_var)
+        if sk is None or dk is None:
+            continue
+        edges.setdefault(sk, set()).add(dk)
+
+    this_key = _var_key(this_var)
+    aliases = {this_key}
+    queue = [this_key]
+    while queue:
+        k = queue.pop()
+        for nk in edges.get(k, ()):
+            if nk not in aliases:
+                aliases.add(nk)
+                queue.append(nk)
+    return aliases
 
 
 def _vars_eq(a, b) -> bool:
@@ -245,7 +272,7 @@ def _vt_ptr_for_class(bv: BinaryView, cls_name: str, existing_cls):
                     return ftype
         except Exception:
             pass
-    primary_qn = QualifiedName(f"{cls_name}::VTable")
+    primary_qn = _qn(f"{cls_name}::VTable")
     if bv.get_type_by_name(primary_qn) is not None:
         try:
             return Type.pointer(bv.arch, Type.named_type_from_registered_type(bv, primary_qn))
@@ -255,16 +282,15 @@ def _vt_ptr_for_class(bv: BinaryView, cls_name: str, existing_cls):
 
 
 def _rebuild_class_with_fields(bv: BinaryView, cls_name: str, rtti: ClassGraph, off_widths: Dict[int, int]) -> int:
-    existing_cls = bv.get_type_by_name(QualifiedName(cls_name))
+    existing_cls = bv.get_type_by_name(_qn(cls_name))
     if existing_cls is None:
         return 0
 
     vt_ptr = _vt_ptr_for_class(bv, cls_name, existing_cls)
-    if vt_ptr is None:
-        return 0
 
     builder = StructureBuilder.create()
-    builder.append(vt_ptr, "vtable")
+    if vt_ptr is not None:
+        builder.append(vt_ptr, "vtable")
     _attach_base_structures(bv, builder, cls_name, rtti)
 
     base_offsets: set[int] = set()
@@ -276,7 +302,9 @@ def _rebuild_class_with_fields(bv: BinaryView, cls_name: str, rtti: ClassGraph, 
 
     added = 0
     for offset in sorted(off_widths.keys()):
-        if offset == 0 or offset in base_offsets:
+        if offset in base_offsets:
+            continue
+        if vt_ptr is not None and offset == 0:
             continue
         width = off_widths[offset]
         ftype = _width_to_type(bv, width)
@@ -291,7 +319,7 @@ def _rebuild_class_with_fields(bv: BinaryView, cls_name: str, rtti: ClassGraph, 
     if added == 0:
         return 0
     try:
-        bv.define_user_type(QualifiedName(cls_name), Type.structure_type(builder))
+        bv.define_user_type(_qn(cls_name), Type.structure_type(builder))
     except Exception as e:
         log.log_warn(f"[MSVC C++] field-discovery: redefine {cls_name} failed: {e}")
         return 0
@@ -299,7 +327,7 @@ def _rebuild_class_with_fields(bv: BinaryView, cls_name: str, rtti: ClassGraph, 
 
 
 def _extend_class(bv: BinaryView, cls_name: str, off_widths: Dict[int, int]) -> int:
-    qn = QualifiedName(cls_name)
+    qn = _qn(cls_name)
     existing = bv.get_type_by_name(qn)
     if existing is None:
         if _EXTEND_DEBUG[0] > 0:
@@ -343,6 +371,8 @@ def _extend_class(bv: BinaryView, cls_name: str, off_widths: Dict[int, int]) -> 
     last_err = None
     for offset in sorted(off_widths.keys()):
         if offset in existing_offsets or offset in base_offsets:
+            continue
+        if vt_ptr is not None and offset == 0:
             continue
         width = off_widths[offset]
         ftype = _width_to_type(bv, width)

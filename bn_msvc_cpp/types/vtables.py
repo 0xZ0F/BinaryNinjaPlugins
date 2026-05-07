@@ -52,6 +52,7 @@ def enrich_vtables(bv: BinaryView, scans: List[VtableScan]) -> int:
     """Build/update Class::VTable named structs from the scans. Returns count touched."""
     from binaryninja import QualifiedName, StructureBuilder, Type
 
+    from .util import qn as _qn
     if not scans:
         return 0
 
@@ -71,15 +72,13 @@ def enrich_vtables(bv: BinaryView, scans: List[VtableScan]) -> int:
         builder = StructureBuilder.create()
         builder.packed = True
 
-        used_names: dict[str, int] = {}
+        used_names: set[str] = set()
         for slot in canonical.slots:
             base = _sanitize_member_name(slot.method_name) or f"slot_{slot.offset:x}"
             name = base
             if name in used_names:
-                used_names[name] += 1
-                name = f"{base}_{used_names[name]}"
-            else:
-                used_names[name] = 0
+                name = f"{base}_at_{slot.offset:x}"
+            used_names.add(name)
             slot_type = void_ptr
             if slot.func_type is not None:
                 try:
@@ -92,7 +91,7 @@ def enrich_vtables(bv: BinaryView, scans: List[VtableScan]) -> int:
             builder.append(slot_type, name)
 
         try:
-            qn = QualifiedName(struct_name)
+            qn = _qn(struct_name)
             bv.define_user_type(qn, Type.structure_type(builder))
         except Exception as e:
             log.log_warn(f"[MSVC C++] failed to define {struct_name}: {e}")

@@ -2,7 +2,15 @@ from binaryninja import BackgroundTaskThread, PluginCommand, log
 
 from ..config import MENU_ROOT, is_msvc_target
 from ..rtti import walk_rtti
-from ..types import build_class_types, discover_fields, enrich_vtables, propagate_this_types, scan_vtables
+from ..types import (
+    build_class_types,
+    discover_fields,
+    discover_vtable_slots,
+    enrich_vtables,
+    ensure_class_placeholders,
+    propagate_this_types,
+    scan_vtables,
+)
 from ..xfg import apply_resolutions, build_hash_index, crossfeed_types, scan_xfg_sites
 
 _REGISTERED = False
@@ -56,6 +64,9 @@ class _FullAnalysisTask(BackgroundTaskThread):
             n_classes = build_class_types(bv, scans, rtti)
             log.log_info(f"[MSVC C++] class structs built/updated: {n_classes}")
 
+            self.progress = "MSVC C++: ensuring class placeholders for non-vtable classes"
+            ensure_class_placeholders(bv)
+
             self.progress = "MSVC C++: propagating `this` types"
             n_propagated = propagate_this_types(bv, scans, rtti)
             log.log_info(f"[MSVC C++] this-typed functions: {n_propagated}")
@@ -63,6 +74,10 @@ class _FullAnalysisTask(BackgroundTaskThread):
             self.progress = "MSVC C++: discovering class fields"
             n_fields = discover_fields(bv, scans, rtti)
             log.log_info(f"[MSVC C++] class fields discovered: {n_fields}")
+
+            self.progress = "MSVC C++: discovering vtable slots"
+            n_slots = discover_vtable_slots(bv)
+            log.log_info(f"[MSVC C++] vtable slots discovered: {n_slots}")
 
             self.progress = "MSVC C++: building XFG hash index"
             hash_index = build_hash_index(bv)

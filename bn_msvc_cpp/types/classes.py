@@ -8,8 +8,68 @@ from binaryninja import (
     log,
 )
 
+from binaryninja import SymbolType
+
 from ..rtti import ClassGraph
+from .util import class_from_full_name, qn as _qn
 from .vtables import VtableScan, _vtable_struct_name
+
+
+def ensure_class_placeholders(bv: BinaryView) -> int:
+    """Walk every function symbol; extract the owning class from its demangled name;
+    ensure each class has at least an empty struct registered. Templated abstract
+    bases like `Microsoft::WRL::AsyncBase<...>` have no vftable but do have methods,
+    and BN auto-generates a `typedef void` placeholder for the type name when first
+    referenced. We replace that with an empty struct so users (and our field-discovery
+    pass) can populate it.
+    """
+    discovered: set[str] = set()
+    for sym in bv.get_symbols_of_type(SymbolType.FunctionSymbol):
+        full = getattr(sym, "full_name", None) or ""
+        cls = class_from_full_name(full)
+        if not cls:
+            continue
+        if cls.startswith("?") or "@" in cls or "::~" in cls or "::`" in cls:
+            continue
+        discovered.add(cls)
+
+    n_created = 0
+    n_vtable_created = 0
+    n_undefined = 0
+    for cls_name in discovered:
+        if _ensure_struct(bv, cls_name):
+            n_created += 1
+        if _ensure_struct(bv, f"{cls_name}::VTable"):
+            n_vtable_created += 1
+    log.log_info(
+        f"[MSVC C++] class placeholders: {n_created} class structs, "
+        f"{n_vtable_created} vtable placeholders, {n_undefined} typedefs replaced"
+    )
+    return n_created
+
+
+def _ensure_struct(bv: BinaryView, name: str) -> bool:
+    qn = _qn(name)
+    existing = bv.get_type_by_name(qn)
+    if existing is not None:
+        structure = getattr(existing, "structure", None)
+        if structure is not None:
+            try:
+                if list(getattr(structure, "members", None) or []):
+                    return False
+            except Exception:
+                return False
+        try:
+            bv.undefine_user_type(qn)
+        except Exception:
+            pass
+    try:
+        builder = StructureBuilder.create()
+        bv.define_user_type(qn, Type.structure_type(builder))
+        return True
+    except Exception as e:
+        log.log_debug(f"[MSVC C++] _ensure_struct({name}) failed: {e}")
+        return False
 
 
 def build_class_types(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph) -> int:
@@ -35,7 +95,7 @@ def build_class_types(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph)
 
     for class_name, scan in primary_by_class.items():
         vt_name = _vtable_struct_name(class_name, scan.mi_for_base)
-        vt_qn = QualifiedName(vt_name)
+        vt_qn = _qn(vt_name)
         if bv.get_type_by_name(vt_qn) is None:
             n_skipped_no_vt += 1
             continue
@@ -48,7 +108,7 @@ def build_class_types(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph)
         builder = StructureBuilder.create()
         builder.append(vt_ptr, "vtable")
         try:
-            bv.define_user_type(QualifiedName(class_name), Type.structure_type(builder))
+            bv.define_user_type(_qn(class_name), Type.structure_type(builder))
             n_built += 1
         except Exception as e:
             log.log_warn(f"[MSVC C++] pass1 failed to define class {class_name}: {e}")
@@ -59,7 +119,7 @@ def build_class_types(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph)
         if node is None or not node.bases:
             continue
         vt_name = _vtable_struct_name(class_name, scan.mi_for_base)
-        vt_qn = QualifiedName(vt_name)
+        vt_qn = _qn(vt_name)
         if bv.get_type_by_name(vt_qn) is None:
             continue
         vt_ref = Type.named_type_from_registered_type(bv, vt_qn)
@@ -69,7 +129,7 @@ def build_class_types(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph)
         if _attach_base_structures(bv, builder, class_name, rtti):
             n_with_bases += 1
             try:
-                bv.define_user_type(QualifiedName(class_name), Type.structure_type(builder))
+                bv.define_user_type(_qn(class_name), Type.structure_type(builder))
             except Exception as e:
                 log.log_warn(f"[MSVC C++] pass2 redefine of {class_name} failed: {e}")
 
@@ -115,7 +175,7 @@ def _attach_base_structures(
 
     bases = []
     for b in node.bases:
-        base_qn = QualifiedName(b.class_name)
+        base_qn = _qn(b.class_name)
         base_t = bv.get_type_by_name(base_qn)
         if base_t is None:
             log.log_info(f"[MSVC C++] base {b.class_name} not yet registered (deferred); skipping for {class_name}")
