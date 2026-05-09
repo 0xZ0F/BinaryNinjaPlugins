@@ -2,4 +2,4 @@
 !.gitignore
 !/*.py
 !/README.md
-!/bn_msvc_cpp
+!/bn_msvc_cpp/*.py

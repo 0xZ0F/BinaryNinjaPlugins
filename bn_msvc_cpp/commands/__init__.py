@@ -1,104 +1,20 @@
-from binaryninja import BackgroundTaskThread, PluginCommand, log
+"""Plugin command registration. All menus live under `MSVC C++\\...`."""
+
+from binaryninja import PluginCommand
 
 from ..config import MENU_ROOT, is_msvc_target
-from ..rtti import walk_rtti
-from ..types import (
-    build_class_types,
-    discover_fields,
-    discover_vtable_slots,
-    enrich_vtables,
-    ensure_class_placeholders,
-    propagate_this_types,
-    scan_vtables,
-)
-from ..xfg import apply_resolutions, build_hash_index, crossfeed_types, scan_xfg_sites
+from . import full_analysis, nav, vtables, xfg
+
 
 _REGISTERED = False
 
 
-class _FullAnalysisTask(BackgroundTaskThread):
-    def __init__(self, bv):
-        super().__init__("MSVC C++: full analysis", can_cancel=True)
-        self.bv = bv
-
-    def run(self):
-        bv = self.bv
-        try:
-            self.progress = "MSVC C++: waiting for analysis"
-            bv.update_analysis_and_wait()
-
-            self.progress = "MSVC C++: reading RTTI metadata"
-            rtti = walk_rtti(bv)
-            log.log_info(f"[MSVC C++] RTTI metadata: {len(rtti)} classes")
-
-            self.progress = "MSVC C++: scanning vftables"
-            scans = scan_vtables(bv)
-            log.log_info(f"[MSVC C++] vftable scans: {len(scans)}")
-
-            by_class: dict[str, int] = {}
-            total_slots = 0
-            mi_count = 0
-            for s in scans:
-                by_class[s.class_name] = by_class.get(s.class_name, 0) + 1
-                total_slots += len(s.slots)
-                if s.mi_for_base is not None:
-                    mi_count += 1
-            log.log_info(
-                f"[MSVC C++] vtable summary: {len(by_class)} unique classes, "
-                f"{mi_count} MI-secondary, {total_slots} total slots"
-            )
-
-            for s in scans[:5]:
-                mi = f" [for `{s.mi_for_base}']" if s.mi_for_base else ""
-                slot_preview = ", ".join(slot.method_name for slot in s.slots[:5]) or "(empty)"
-                log.log_info(
-                    f"[MSVC C++]   {hex(s.vft_addr)} {s.class_name}{mi} "
-                    f"slots={len(s.slots)} sample=[{slot_preview}]"
-                )
-
-            self.progress = "MSVC C++: enriching vtable structs"
-            n_built = enrich_vtables(bv, scans)
-            log.log_info(f"[MSVC C++] vtable structs built/updated: {n_built}")
-
-            self.progress = "MSVC C++: building class structs"
-            n_classes = build_class_types(bv, scans, rtti)
-            log.log_info(f"[MSVC C++] class structs built/updated: {n_classes}")
-
-            self.progress = "MSVC C++: ensuring class placeholders for non-vtable classes"
-            ensure_class_placeholders(bv)
-
-            self.progress = "MSVC C++: propagating `this` types"
-            n_propagated = propagate_this_types(bv, scans, rtti)
-            log.log_info(f"[MSVC C++] this-typed functions: {n_propagated}")
-
-            self.progress = "MSVC C++: discovering class fields"
-            n_fields = discover_fields(bv, scans, rtti)
-            log.log_info(f"[MSVC C++] class fields discovered: {n_fields}")
-
-            self.progress = "MSVC C++: discovering vtable slots"
-            n_slots = discover_vtable_slots(bv)
-            log.log_info(f"[MSVC C++] vtable slots discovered: {n_slots}")
-
-            self.progress = "MSVC C++: building XFG hash index"
-            hash_index = build_hash_index(bv)
-
-            self.progress = "MSVC C++: scanning XFG call sites"
-            xfg_sites = scan_xfg_sites(bv, hash_index)
-            log.log_info(f"[MSVC C++] XFG total sites: {len(xfg_sites)}")
-
-            self.progress = "MSVC C++: cross-feeding vtable type info"
-            crossfeed_types(bv, scans, xfg_sites, rtti)
-
-            self.progress = "MSVC C++: applying XFG resolutions"
-            n_xfg_applied = apply_resolutions(bv, xfg_sites)
-            log.log_info(f"[MSVC C++] XFG total applied: {n_xfg_applied}")
-        except Exception as e:
-            log.log_error(f"[MSVC C++] full-analysis task failed: {e}")
-            raise
+def _is_addr(bv, _addr) -> bool:
+    return is_msvc_target(bv)
 
 
-def _run_full_analysis(bv) -> None:
-    _FullAnalysisTask(bv).start()
+def _is_func(bv, _func) -> bool:
+    return is_msvc_target(bv)
 
 
 def register_all() -> None:
@@ -107,9 +23,128 @@ def register_all() -> None:
         return
     _REGISTERED = True
 
+    # ---- Run Full Analysis ----------------------------------------------
     PluginCommand.register(
         f"{MENU_ROOT}\\Run Full Analysis",
-        "Walk RTTI metadata + vftable symbols; report class graph",
-        _run_full_analysis,
+        "Auto-define vtable + class structs, re-type slot fields from function "
+        "prototypes, and resolve all XFG indirect calls in one pass.",
+        full_analysis.cmd_run_full_analysis,
+        is_valid=is_msvc_target,
+    )
+
+    # ---- VTables --------------------------------------------------------
+    PluginCommand.register(
+        f"{MENU_ROOT}\\VTables\\Auto-Define for All Classes",
+        "Create typed VTable structs from RTTI symbols and update class structs",
+        vtables.cmd_process_all,
+        is_valid=is_msvc_target,
+    )
+    PluginCommand.register_for_address(
+        f"{MENU_ROOT}\\VTables\\Auto-Define for This Class",
+        "Auto-define vtable structs for the class at this address",
+        vtables.cmd_process_for_address,
+        is_valid=_is_addr,
+    )
+    PluginCommand.register_for_function(
+        f"{MENU_ROOT}\\VTables\\Auto-Define for This Class",
+        "Auto-define vtable structs for the class this function belongs to",
+        vtables.cmd_process_for_function,
+        is_valid=_is_func,
+    )
+    PluginCommand.register(
+        f"{MENU_ROOT}\\VTables\\Type All Fields from Functions",
+        "Re-type all VTable struct fields as function pointers and propagate "
+        "signatures to call sites",
+        vtables.cmd_type_all_vtables,
+        is_valid=is_msvc_target,
+    )
+    PluginCommand.register_for_address(
+        f"{MENU_ROOT}\\VTables\\Navigate to Virtual Function",
+        "Resolve the vtable dispatch at this address and navigate to the target function",
+        nav.cmd_navigate_to_virtual,
+        is_valid=_is_addr,
+    )
+
+    # ---- XFG: Cross-References -----------------------------------------
+    PluginCommand.register_for_address(
+        f"{MENU_ROOT}\\XFG\\Cross-References\\Find Here",
+        "Add XFG xrefs for the function at this address to the cross-references panel",
+        xfg.cmd_xref_for_address,
+        is_valid=_is_addr,
+    )
+    PluginCommand.register_for_function(
+        f"{MENU_ROOT}\\XFG\\Cross-References\\Find in This Function",
+        "Add XFG xrefs for this function to the cross-references panel",
+        xfg.cmd_xref_for_function,
+        is_valid=_is_func,
+    )
+    PluginCommand.register(
+        f"{MENU_ROOT}\\XFG\\Cross-References\\Add All",
+        "Scan entire binary and add all resolvable XFG xrefs to the cross-references panel",
+        xfg.cmd_xref_add_all,
+        is_valid=is_msvc_target,
+    )
+    PluginCommand.register(
+        f"{MENU_ROOT}\\XFG\\Cross-References\\Remove All",
+        "Remove all XFG xrefs previously added by this plugin",
+        xfg.cmd_xref_remove_all,
+        is_valid=is_msvc_target,
+    )
+
+    # ---- XFG: Indirect Calls -------------------------------------------
+    PluginCommand.register_for_address(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\Resolve Here",
+        "Set indirect branch targets and 'XFG ->' comment on the XFG-guarded call at this address",
+        xfg.cmd_resolve_here,
+        is_valid=_is_addr,
+    )
+    PluginCommand.register_for_address(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\Remove Here",
+        "Clear indirect branch targets and 'XFG ->' comment on the XFG-guarded call at this address",
+        xfg.cmd_remove_here,
+        is_valid=_is_addr,
+    )
+    PluginCommand.register_for_address(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\Go to Target Here",
+        "Navigate to the target of the XFG-guarded call at this address (chooser on hash collision)",
+        xfg.cmd_goto_xfg_target,
+        is_valid=_is_addr,
+    )
+    PluginCommand.register_for_address(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\View Candidates Here",
+        "List every function whose XFG hash matches the call at the cursor",
+        xfg.cmd_view_candidates,
+        is_valid=_is_addr,
+    )
+    PluginCommand.register_for_function(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\Resolve in This Function",
+        "Set indirect branch targets and 'XFG ->' comments on every XFG call site in this function",
+        xfg.cmd_resolve_in_func,
+        is_valid=_is_func,
+    )
+    PluginCommand.register_for_function(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\Remove in This Function",
+        "Clear indirect branch targets and 'XFG ->' comments on every XFG call site in this function",
+        xfg.cmd_remove_in_func,
+        is_valid=_is_func,
+    )
+    PluginCommand.register(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\Resolve All",
+        "Scan entire binary and register indirect branch targets at XFG-guarded call sites",
+        xfg.cmd_resolve_all,
+        is_valid=is_msvc_target,
+    )
+    PluginCommand.register(
+        f"{MENU_ROOT}\\XFG\\Indirect Calls\\Remove All",
+        "Remove user-set indirect branch targets previously added at XFG call sites",
+        xfg.cmd_remove_all,
+        is_valid=is_msvc_target,
+    )
+
+    # ---- XFG: Reset cache ----------------------------------------------
+    PluginCommand.register(
+        f"{MENU_ROOT}\\XFG\\Reset Hash Map Cache",
+        "Invalidate the cached XFG hash map (use after adding/removing functions mid-session)",
+        xfg.cmd_reset_hash_map,
         is_valid=is_msvc_target,
     )

@@ -1,64 +1,78 @@
-from typing import List
+"""Per-site XFG resolution: write `XFG -> ...` comment + (optionally) set
+indirect-branch targets, or clear them.
 
-from binaryninja import BinaryView, log
+Verbatim port from `xfg_xrefs.py` apart from the comment text, which now
+goes through the compact `comment.format_comment`.
+"""
 
-from .scan import XfgSite
+from binaryninja import BinaryView
+
+from .comment import format_comment
+from .crossfeed import final_targets_to_write
+from .hash_index import find_targets_for_hash
+from .sites import find_xfg_call
 
 
-def apply_resolutions(bv: BinaryView, sites: List[XfgSite]) -> int:
-    n_unique = 0
-    n_aliased = 0
-    n_unresolved = 0
-    n_skipped = 0
+def resolve_one_xfg_site(
+    bv: BinaryView, movabs_addr: int, hash_map: dict, ctx=None
+) -> tuple:
+    """Apply XFG branch targets and 'XFG -> ...' comment at one movabs r10 site.
 
-    for site in sites:
-        if site.func_start is None:
-            n_skipped += 1
-            continue
-        func = bv.get_function_at(site.func_start)
-        if func is None:
-            n_skipped += 1
-            continue
+    Returns (status, comment) where status is one of:
+        "resolved", "resolved-disambig", "resolved-comment-only",
+        "no-targets", "no-call", "no-func"
 
-        if len(site.targets) == 1:
-            target = site.targets[0]
-            target_func = bv.get_function_at(target)
-            target_name = target_func.name if target_func else hex(target)
-            try:
-                func.set_user_indirect_branches(site.call_addr, [(bv.arch, target)])
-                func.add_user_code_ref(site.call_addr, target)
-                func.set_comment_at(site.call_addr, f"XFG -> {target_name}")
-                n_unique += 1
-            except Exception as e:
-                log.log_debug(f"[MSVC C++] xfg.apply unique {hex(site.call_addr)} failed: {e}")
-                n_skipped += 1
-        elif len(site.targets) > 1:
-            try:
-                preview_count = min(8, len(site.targets))
-                names: list[str] = []
-                for t in site.targets[:preview_count]:
-                    tf = bv.get_function_at(t)
-                    names.append(tf.name if tf else hex(t))
-                more = len(site.targets) - preview_count
-                comment = f"XFG hash {hex(site.hash_value)} ({len(site.targets)} candidates): " + ", ".join(names)
-                if more > 0:
-                    comment += f" ... +{more} more"
-                func.set_comment_at(site.call_addr, comment)
-                n_aliased += 1
-            except Exception as e:
-                log.log_debug(f"[MSVC C++] xfg.apply aliased {hex(site.call_addr)} failed: {e}")
-                n_skipped += 1
-        else:
-            try:
-                func.set_comment_at(site.call_addr, f"XFG hash {hex(site.hash_value)} unresolved")
-                n_unresolved += 1
-            except Exception as e:
-                log.log_debug(f"[MSVC C++] xfg.apply unresolved {hex(site.call_addr)} failed: {e}")
-                n_skipped += 1
+    "resolved-disambig"     : alias list narrowed to 1 concrete target via vtable
+    "resolved-comment-only" : alias-rich, no vtable disambig - comment only,
+                              no indirect branches written (avoids BNDB bloat)
+    """
+    hash_bytes = bv.read(movabs_addr + 2, 8)
+    if not hash_bytes or len(hash_bytes) < 8:
+        return "no-targets", ""
+    call_hash = int.from_bytes(hash_bytes, "little")
+    targets = find_targets_for_hash(bv, call_hash, hash_map)
+    if not targets:
+        return "no-targets", ""
+    call_addr = find_xfg_call(bv, movabs_addr)
+    if call_addr is None:
+        return "no-call", ""
+    funcs = bv.get_functions_containing(call_addr)
+    if not funcs:
+        return "no-func", ""
 
-    log.log_info(
-        f"[MSVC C++] XFG applied: {n_unique} CFG edges, "
-        f"{n_aliased} aliased comments, {n_unresolved} unresolved comments, "
-        f"{n_skipped} skipped"
+    # Comment always reflects the full alias family — even when narrowing
+    # collapsed the indirect-branch list to a single concrete target, the
+    # comment shows whether the call site is alias-rich.
+    comment = format_comment(bv, call_hash, targets)
+    bv.set_comment_at(call_addr, comment)
+
+    write_targets, write_status = final_targets_to_write(
+        bv, movabs_addr, targets, ctx
     )
-    return n_unique + n_aliased + n_unresolved
+    if not write_targets:
+        return "resolved-comment-only", comment
+    funcs[0].set_user_indirect_branches(
+        call_addr, [(bv.arch, t) for t in write_targets]
+    )
+    if write_status == "ok-disambig":
+        return "resolved-disambig", comment
+    return "resolved", comment
+
+
+def clear_one_xfg_site(bv: BinaryView, movabs_addr: int) -> str:
+    """Clear XFG branch targets and comment at one movabs r10 site.
+
+    Returns one of: "cleared", "no-call", "no-func".
+
+    Does NOT require a hash match — cleanup must succeed even when the
+    original target was renamed, deleted, or its function-hash byte changed.
+    """
+    call_addr = find_xfg_call(bv, movabs_addr)
+    if call_addr is None:
+        return "no-call"
+    funcs = bv.get_functions_containing(call_addr)
+    if not funcs:
+        return "no-func"
+    funcs[0].set_user_indirect_branches(call_addr, [])
+    bv.set_comment_at(call_addr, "")
+    return "cleared"

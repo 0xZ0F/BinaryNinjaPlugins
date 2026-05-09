@@ -1,240 +1,238 @@
-from typing import Dict, List, Optional, Tuple
+"""XFG alias disambiguation via vtable dispatch.
 
-from binaryninja import BinaryView, log
+When an XFG hash maps to many functions (every IUnknown::Release override
+shares one prototype-hash), inspecting the vtable slot loaded into RAX before
+the `movabs r10` typically narrows to the single concrete target. This is
+the dominant XFG resolution path on RTTI-rich binaries.
 
-from ..rtti import ClassGraph
-from ..types import VtableScan
-from .scan import XfgSite
+Verbatim port from `xfg_xrefs.py`.
+"""
 
-_CALL_OPS = {"MLIL_CALL", "MLIL_CALL_UNTYPED", "MLIL_TAILCALL", "MLIL_TAILCALL_UNTYPED",
-             "MLIL_CALL_SSA", "MLIL_CALL_UNTYPED_SSA", "MLIL_TAILCALL_SSA"}
+from binaryninja import BinaryView
+from binaryninja.enums import TypeClass
 
-
-def crossfeed_types(
-    bv: BinaryView,
-    scans: List[VtableScan],
-    sites: List[XfgSite],
-    rtti: ClassGraph,
-) -> int:
-    cls_slot_index: Dict[Tuple[str, int], int] = {}
-    for scan in scans:
-        if scan.mi_for_base is not None:
-            continue
-        for slot in scan.slots:
-            cls_slot_index[(scan.class_name, slot.offset)] = slot.target
-    log.log_info(f"[MSVC C++] crossfeed index: {len(cls_slot_index)} (class, slot) entries")
-
-    n_narrowed = 0
-    n_inspected = 0
-    n_pattern_match = 0
-
-    for site in sites:
-        if len(site.targets) <= 1:
-            continue
-        n_inspected += 1
-        info = _resolve_call_context(bv, site, debug=False)
-        if info is None:
-            continue
-        n_pattern_match += 1
-        cls_name, slot_offset = info
-        target = cls_slot_index.get((cls_name, slot_offset))
-        if target is None or target not in site.targets:
-            continue
-        site.targets = [target]
-        n_narrowed += 1
-
-    log.log_info(
-        f"[MSVC C++] crossfeed: inspected {n_inspected} aliased sites, "
-        f"{n_pattern_match} matched the vtable pattern, "
-        f"{n_narrowed} narrowed to unique"
-    )
-    return n_narrowed
+from ..types.classes import find_class_offsets, offset_cache
+from ..types.vtables import find_vtable_symbols
+from ..util import demangled_function_name, class_name_from_func
+from .dispatch import get_vtable_dispatch_info
+from .settings import get_alias_threshold, get_metadata_mode
+from .sites import find_xfg_call
 
 
-def _op_name(expr) -> str:
-    op = getattr(expr, "operation", None)
-    if op is None:
-        return ""
-    return getattr(op, "name", str(op))
+VTABLE_DISAMBIG_KEY = "bn_msvc_cpp:xfg_vtable_disambig_ctx"
 
 
-_PRIMITIVES = {"int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
-               "uint32_t", "uint64_t", "char", "void", "bool"}
+def get_vtable_disambig_ctx(bv: BinaryView):
+    """Return a context for vtable-based XFG target disambiguation, or None.
 
-
-def _resolve_call_context(bv: BinaryView, site: XfgSite, debug: bool = False) -> Optional[Tuple[str, int]]:
-    if site.func_start is None:
-        return None
-    func = bv.get_function_at(site.func_start)
-    if func is None:
-        return None
+    Cached on bv.session_data. Returns None (cached as False) when the binary
+    has no RTTI vtable symbols, in which case `_narrow_targets` falls back to
+    the threshold cap.
+    """
+    cached = bv.session_data.get(VTABLE_DISAMBIG_KEY)
+    if cached is not None:
+        return cached if cached is not False else None
     try:
-        mlil_ssa = func.medium_level_il.ssa_form
+        vtable_map = find_vtable_symbols(bv)
     except Exception:
+        bv.session_data[VTABLE_DISAMBIG_KEY] = False
         return None
-    if mlil_ssa is None:
+    if not vtable_map:
+        bv.session_data[VTABLE_DISAMBIG_KEY] = False
         return None
-
-    inst = _find_inst_at(mlil_ssa, site.call_addr)
-    if inst is None:
-        return None
-    if _op_name(inst) not in _CALL_OPS:
-        return None
-
-    dest = getattr(inst, "dest", None)
-    if dest is None:
-        return None
-
-    if debug:
-        log.log_info(
-            f"[MSVC C++] crossfeed @ {hex(site.call_addr)} "
-            f"({len(site.targets)} candidates): dest_op={_op_name(dest)}"
-        )
-
-    result = _resolve_expr(dest, mlil_ssa, depth=0, debug=debug)
-    if debug:
-        log.log_info(f"[MSVC C++] crossfeed @ {hex(site.call_addr)}: result={result}")
-    return result
+    ctx = {"vtable_map": vtable_map}
+    bv.session_data[VTABLE_DISAMBIG_KEY] = ctx
+    return ctx
 
 
-def _find_inst_at(mlil, addr: int):
-    for inst in mlil.instructions:
-        if inst.address == addr:
-            return inst
-    return None
-
-
-def _resolve_expr(expr, mlil_ssa, depth: int, debug: bool) -> Optional[Tuple[str, int]]:
-    if depth > 8 or expr is None or not hasattr(expr, "operation"):
-        return None
-    op = _op_name(expr)
-
-    if op in ("MLIL_VAR_SSA", "MLIL_VAR"):
-        rhs = _follow_var_def(expr, mlil_ssa, debug)
-        if rhs is None:
-            return None
-        return _resolve_expr(rhs, mlil_ssa, depth + 1, debug)
-
-    if op in ("MLIL_LOAD_SSA", "MLIL_LOAD"):
-        return _extract_vtable_pattern(expr, mlil_ssa, depth, debug)
-
-    if op in ("MLIL_LOAD_STRUCT_SSA", "MLIL_LOAD_STRUCT"):
-        slot_offset = int(getattr(expr, "offset", 0) or 0)
-        base = getattr(expr, "src", None)
-        return _resolve_with_known_offset(base, slot_offset, mlil_ssa, depth, debug)
-
-    return None
-
-
-def _resolve_with_known_offset(base, slot_offset: int, mlil_ssa, depth: int, debug: bool) -> Optional[Tuple[str, int]]:
-    if base is None or not hasattr(base, "operation"):
-        return None
-    op = _op_name(base)
-    if op in ("MLIL_LOAD_SSA", "MLIL_LOAD"):
-        receiver_expr = getattr(base, "src", None)
-    elif op in ("MLIL_LOAD_STRUCT_SSA", "MLIL_LOAD_STRUCT"):
-        receiver_expr = getattr(base, "src", None)
-    elif op in ("MLIL_VAR_SSA", "MLIL_VAR"):
-        underlying = _follow_var_def(base, mlil_ssa, debug)
-        if underlying is None or not hasattr(underlying, "operation"):
-            return None
-        return _resolve_with_known_offset(underlying, slot_offset, mlil_ssa, depth + 1, debug)
-    else:
-        return None
-    cls_name = _class_from_receiver_expr(receiver_expr, mlil_ssa, depth + 1, debug)
-    if cls_name is None:
-        return None
-    return cls_name, slot_offset
-
-
-def _follow_var_def(var_expr, mlil_ssa, debug: bool):
-    op = _op_name(var_expr)
-    try:
-        if op == "MLIL_VAR_SSA":
-            ssa_var = getattr(var_expr, "src", None)
-            if ssa_var is None:
-                return None
-            def_inst = mlil_ssa.get_ssa_var_definition(ssa_var)
-        else:
-            var = getattr(var_expr, "var", None)
-            if var is None:
-                return None
-            defs = mlil_ssa.get_var_definitions(var)
-            if not defs:
-                return None
-            def_inst = defs[-1]
-    except Exception:
-        return None
-    if def_inst is None:
-        return None
-    rhs = getattr(def_inst, "src", None)
-    if debug and rhs is not None:
-        log.log_info(f"[MSVC C++]   def: {_op_name(def_inst)} -> rhs={_op_name(rhs)}")
-    return rhs
-
-
-def _extract_vtable_pattern(load_expr, mlil_ssa, depth: int, debug: bool) -> Optional[Tuple[str, int]]:
-    src = getattr(load_expr, "src", None)
-    if src is None or not hasattr(src, "operation"):
-        return None
-    op = _op_name(src)
-
-    slot_offset = 0
-    base = src
-    if op == "MLIL_ADD":
-        left = getattr(src, "left", None)
-        right = getattr(src, "right", None)
-        if right is not None and _op_name(right) == "MLIL_CONST":
-            slot_offset = int(getattr(right, "constant", 0))
-            base = left
-        elif left is not None and _op_name(left) == "MLIL_CONST":
-            slot_offset = int(getattr(left, "constant", 0))
-            base = right
-        else:
-            return None
-    return _resolve_with_known_offset(base, slot_offset, mlil_ssa, depth, debug)
-
-
-def _class_from_receiver_expr(expr, mlil_ssa, depth: int, debug: bool) -> Optional[str]:
-    if depth > 8 or expr is None or not hasattr(expr, "operation"):
-        return None
-    op = _op_name(expr)
-    if op in ("MLIL_VAR_SSA", "MLIL_VAR"):
-        var = None
-        if op == "MLIL_VAR_SSA":
-            ssa_var = getattr(expr, "src", None)
-            if ssa_var is not None:
-                var = getattr(ssa_var, "var", None)
-        else:
-            var = getattr(expr, "var", None)
-        if var is None:
-            return None
-        cls = _class_from_var_type(var.type)
-        if cls is not None:
-            return cls
-        next_rhs = _follow_var_def(expr, mlil_ssa, debug)
-        if next_rhs is not None and hasattr(next_rhs, "operation"):
-            return _class_from_receiver_expr(next_rhs, mlil_ssa, depth + 1, debug)
-    return None
-
-
-def _class_from_var_type(var_type) -> Optional[str]:
-    if var_type is None:
-        return None
-    target = getattr(var_type, "target", None)
+def _class_from_pointed_type(target, vtable_map: dict):
+    """Return the vtable_map key for the type a pointer targets, else None."""
     if target is None:
         return None
-    s = str(target).strip()
-    while s.endswith("*"):
-        s = s[:-1].strip()
-    s = s.strip("`'")
-    if s.startswith("struct "):
-        s = s[len("struct "):].strip().strip("`'")
-    if s.endswith("::VTable"):
-        s = s[: -len("::VTable")]
-    elif "::VTable_for_" in s:
-        s = s.split("::VTable_for_", 1)[0]
-    s = s.strip().strip("`'")
-    if not s or s in _PRIMITIVES:
+    try:
+        if target.type_class == TypeClass.NamedTypeReferenceClass:
+            name = str(target.name)
+            return name if name in vtable_map else None
+        if target.type_class == TypeClass.StructureTypeClass:
+            reg = getattr(target, "registered_name", None)
+            if reg:
+                name = str(reg)
+                return name if name in vtable_map else None
+    except Exception:
         return None
-    return s
+    return None
+
+
+def _calling_class_from_call_first_arg(
+    bv: BinaryView, call_addr: int, vtable_map: dict
+):
+    """Tier-2 fallback: derive the class from the type of the call's first argument.
+
+    On x86_64 fastcall the first argument is the dispatched object — for a
+    virtual call `obj->Method(args...)`, MLIL renders it as `Method(obj, args)`
+    with `obj` as params[0]. This handles the common case where the calling
+    function itself is *not* a method of an RTTI class (free functions, helpers,
+    WRL template glue) but the dispatched object IS typed as a registered
+    struct.
+    """
+    funcs = bv.get_functions_containing(call_addr)
+    if not funcs:
+        return None
+    func = funcs[0]
+    try:
+        mlil_insn = func.get_medium_level_il_at(call_addr)
+    except Exception:
+        return None
+    if mlil_insn is None:
+        return None
+
+    params = None
+    try:
+        params = list(mlil_insn.params)
+    except Exception:
+        return None
+    if not params:
+        return None
+
+    first = params[0]
+    et = None
+    try:
+        et = first.expr_type
+    except Exception:
+        et = None
+    if et is None:
+        try:
+            et = first.var.type
+        except Exception:
+            et = None
+    if et is None:
+        return None
+    try:
+        if et.type_class != TypeClass.PointerTypeClass:
+            return None
+    except Exception:
+        return None
+    return _class_from_pointed_type(et.target, vtable_map)
+
+
+def _get_calling_class(bv: BinaryView, addr: int, vtable_map: dict):
+    """Return the vtable_map key matching the class of the function containing addr."""
+    funcs = bv.get_functions_containing(addr)
+    if not funcs:
+        return None
+    name = demangled_function_name(bv.arch, funcs[0].name)
+    return class_name_from_func(name, vtable_map)
+
+
+def try_vtable_disambig(
+    bv: BinaryView, movabs_addr: int, targets: list, ctx
+):
+    """Resolve XFG aliases to a concrete single target via vtable dispatch.
+
+    Returns [fp_addr] on success, or None if the call can't be narrowed (no
+    vtable context, non-vtable dispatch shape, no class match, fp not in
+    alias set, etc.).
+    """
+    if ctx is None:
+        return None
+    vtable_map = ctx["vtable_map"]
+
+    call_addr = find_xfg_call(bv, movabs_addr)
+    if call_addr is None:
+        return None
+
+    try:
+        slot_offset, vtable_class_offset = get_vtable_dispatch_info(bv, call_addr)
+    except Exception:
+        return None
+    if slot_offset is None:
+        return None
+
+    # Tier 1: function name -> class via RTTI prefix match.
+    try:
+        calling_class = _get_calling_class(bv, call_addr, vtable_map)
+    except Exception:
+        calling_class = None
+
+    # Tier 2: type of the call's first MLIL argument (the dispatched object).
+    if not calling_class or calling_class not in vtable_map:
+        calling_class = _calling_class_from_call_first_arg(bv, call_addr, vtable_map)
+    if not calling_class or calling_class not in vtable_map:
+        return None
+
+    class_addrs = [a for a, _ in vtable_map[calling_class]]
+    try:
+        cache = offset_cache(bv)
+        missing = [a for a in class_addrs if a not in cache]
+        if missing:
+            for a, off in find_class_offsets(bv, missing).items():
+                cache[a] = off
+    except Exception:
+        return None
+
+    matching_vtable = None
+    if vtable_class_offset is not None:
+        for a in class_addrs:
+            if cache.get(a) == vtable_class_offset:
+                matching_vtable = a
+                break
+    elif len(class_addrs) == 1:
+        matching_vtable = class_addrs[0]
+    if matching_vtable is None:
+        return None
+
+    raw = bv.read(matching_vtable + slot_offset, 8)
+    if not raw or len(raw) < 8:
+        return None
+    fp_addr = int.from_bytes(raw, "little")
+    if fp_addr == 0 or fp_addr not in targets:
+        return None
+    return [fp_addr]
+
+
+def narrow_targets(
+    bv: BinaryView, movabs_addr: int, targets: list, ctx
+):
+    """Reduce alias-rich XFG target lists via vtable dispatch or threshold cap.
+
+    Returns:
+      * list[int] - targets to write metadata (xrefs / indirect branches) for
+      * None      - alias-rich and undisambiguable; caller should write the
+                    'XFG ->' comment but skip metadata to avoid BNDB bloat
+    """
+    if len(targets) <= 1:
+        return list(targets)
+    narrowed = try_vtable_disambig(bv, movabs_addr, targets, ctx)
+    if narrowed is not None:
+        return narrowed
+    if len(targets) <= get_alias_threshold():
+        return list(targets)
+    return None
+
+
+def final_targets_to_write(
+    bv: BinaryView, movabs_addr: int, targets: list, ctx, mode: str | None = None
+) -> tuple:
+    """Apply alias threshold + metadata mode and return what should be written.
+
+    Returns (targets_to_write, status):
+      * status "ok"               - len>0, len(targets) <= 1 OR not a disambig case
+      * status "ok-disambig"      - narrowed from many aliases to a single concrete
+      * status "skip-mode-none"   - mode=none, write nothing
+      * status "skip-alias"       - alias-rich and undisambiguable
+      * status "skip-not-disambig"- mode=disambig_only and we couldn't narrow to 1
+    """
+    if mode is None:
+        mode = get_metadata_mode()
+    if mode == "none":
+        return [], "skip-mode-none"
+
+    narrowed = narrow_targets(bv, movabs_addr, targets, ctx)
+    if narrowed is None:
+        return [], "skip-alias"
+
+    is_disambig = len(targets) > 1 and len(narrowed) == 1
+    if mode == "disambig_only" and len(narrowed) > 1:
+        return [], "skip-not-disambig"
+
+    return narrowed, "ok-disambig" if is_disambig else "ok"

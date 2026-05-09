@@ -1,13 +1,14 @@
-from .scan import XfgSite, scan_xfg_sites
-from .hash_index import HashIndex, build_hash_index
-from .crossfeed import crossfeed_types
-from .apply import apply_resolutions
+"""XFG (eXtended Flow Guard) hash recovery, indirect-call resolution, and
+vtable-based alias disambiguation."""
+
+from . import apply, comment, crossfeed, dispatch, hash_index, settings, sites
 
 __all__ = [
-    "scan_xfg_sites",
-    "XfgSite",
-    "build_hash_index",
-    "HashIndex",
-    "crossfeed_types",
-    "apply_resolutions",
+    "apply",
+    "comment",
+    "crossfeed",
+    "dispatch",
+    "hash_index",
+    "settings",
+    "sites",
 ]

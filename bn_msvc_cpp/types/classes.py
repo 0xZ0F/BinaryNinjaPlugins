@@ -1,208 +1,311 @@
-from typing import List, Optional
+"""Class struct + interface struct manipulation, and locating where each
+vtable address is stored into an object (so the class struct's vtable
+pointer field can be placed at the right offset).
 
-from binaryninja import (
-    BinaryView,
-    QualifiedName,
-    StructureBuilder,
-    Type,
-    log,
+Verbatim port of the relevant logic from `vtable_autodefine.py`.
+"""
+
+import re
+
+from binaryninja import BinaryView, log_info, log_warn
+from binaryninja.enums import (
+    HighLevelILOperation,
+    MediumLevelILOperation,
+    TypeClass,
+)
+from binaryninja.types import StructureBuilder, Type
+
+from ..util import strip_elaborated_type_keywords
+
+
+# Patterns BN's "Create All Members" / structure-from-offset analysis emits
+# for fields it inferred without a name. Replacing these with our typed
+# vtable pointers is desirable; replacing a field a user has hand-named is
+# not (idempotency).
+_AUTO_FIELD_RE = re.compile(
+    r"^(?:offset_[0-9a-fA-F]+|field_[0-9a-fA-F]+|__offset\(.*\)\.[a-z]+|vtable(?:_[A-Za-z0-9_]+)?)$"
 )
 
-from binaryninja import SymbolType
 
-from ..rtti import ClassGraph
-from .util import class_from_full_name, qn as _qn
-from .vtables import VtableScan, _vtable_struct_name
-
-
-def ensure_class_placeholders(bv: BinaryView) -> int:
-    """Walk every function symbol; extract the owning class from its demangled name;
-    ensure each class has at least an empty struct registered. Templated abstract
-    bases like `Microsoft::WRL::AsyncBase<...>` have no vftable but do have methods,
-    and BN auto-generates a `typedef void` placeholder for the type name when first
-    referenced. We replace that with an empty struct so users (and our field-discovery
-    pass) can populate it.
+def is_replaceable_field_name(name: str) -> bool:
+    """Return True if `name` is a BN-auto-generated placeholder OR our own
+    previous-run output (`vtable`, `vtable_<iface>`).
     """
-    discovered: set[str] = set()
-    for sym in bv.get_symbols_of_type(SymbolType.FunctionSymbol):
-        full = getattr(sym, "full_name", None) or ""
-        cls = class_from_full_name(full)
-        if not cls:
-            continue
-        if cls.startswith("?") or "@" in cls or "::~" in cls or "::`" in cls:
-            continue
-        discovered.add(cls)
-
-    n_created = 0
-    n_vtable_created = 0
-    n_undefined = 0
-    for cls_name in discovered:
-        if _ensure_struct(bv, cls_name):
-            n_created += 1
-        if _ensure_struct(bv, f"{cls_name}::VTable"):
-            n_vtable_created += 1
-    log.log_info(
-        f"[MSVC C++] class placeholders: {n_created} class structs, "
-        f"{n_vtable_created} vtable placeholders, {n_undefined} typedefs replaced"
-    )
-    return n_created
-
-
-def _ensure_struct(bv: BinaryView, name: str) -> bool:
-    qn = _qn(name)
-    existing = bv.get_type_by_name(qn)
-    if existing is not None:
-        structure = getattr(existing, "structure", None)
-        if structure is not None:
-            try:
-                if list(getattr(structure, "members", None) or []):
-                    return False
-            except Exception:
-                return False
-        try:
-            bv.undefine_user_type(qn)
-        except Exception:
-            pass
-    try:
-        builder = StructureBuilder.create()
-        bv.define_user_type(qn, Type.structure_type(builder))
+    if not name:
         return True
-    except Exception as e:
-        log.log_debug(f"[MSVC C++] _ensure_struct({name}) failed: {e}")
-        return False
+    return bool(_AUTO_FIELD_RE.match(name))
 
 
-def build_class_types(bv: BinaryView, scans: List[VtableScan], rtti: ClassGraph) -> int:
-    primary_by_class: dict[str, VtableScan] = {}
-    secondaries_by_class: dict[str, list[VtableScan]] = {}
-    for s in scans:
-        if s.mi_for_base is None:
-            existing = primary_by_class.get(s.class_name)
-            if existing is None or len(s.slots) > len(existing.slots):
-                primary_by_class[s.class_name] = s
-        else:
-            secondaries_by_class.setdefault(s.class_name, []).append(s)
+# ---- Locate vtable-pointer offsets in the class struct -----------------
 
-    n_mi_promoted = 0
-    for cls_name, secs in secondaries_by_class.items():
-        if cls_name in primary_by_class:
-            continue
-        primary_by_class[cls_name] = max(secs, key=lambda x: len(x.slots))
-        n_mi_promoted += 1
+def _extract_store_offset(dest):
+    """Extract the byte offset from an HLIL assignment destination expression."""
+    try:
+        op = dest.operation
 
-    n_built = 0
-    n_skipped_no_vt = 0
+        if op == HighLevelILOperation.HLIL_DEREF:
+            return _extract_store_offset(dest.src)
 
-    for class_name, scan in primary_by_class.items():
-        vt_name = _vtable_struct_name(class_name, scan.mi_for_base)
-        vt_qn = _qn(vt_name)
-        if bv.get_type_by_name(vt_qn) is None:
-            n_skipped_no_vt += 1
-            continue
-        try:
-            vt_ref = Type.named_type_from_registered_type(bv, vt_qn)
-        except Exception as e:
-            log.log_debug(f"[MSVC C++] named ref for {vt_qn} failed: {e}")
-            continue
-        vt_ptr = Type.pointer(bv.arch, vt_ref)
-        builder = StructureBuilder.create()
-        builder.append(vt_ptr, "vtable")
-        try:
-            bv.define_user_type(_qn(class_name), Type.structure_type(builder))
-            n_built += 1
-        except Exception as e:
-            log.log_warn(f"[MSVC C++] pass1 failed to define class {class_name}: {e}")
+        if op == HighLevelILOperation.HLIL_STRUCT_FIELD:
+            return dest.offset
 
-    n_with_bases = 0
-    for class_name, scan in primary_by_class.items():
-        node = rtti.by_name.get(class_name)
-        if node is None or not node.bases:
-            continue
-        vt_name = _vtable_struct_name(class_name, scan.mi_for_base)
-        vt_qn = _qn(vt_name)
-        if bv.get_type_by_name(vt_qn) is None:
-            continue
-        vt_ref = Type.named_type_from_registered_type(bv, vt_qn)
-        vt_ptr = Type.pointer(bv.arch, vt_ref)
-        builder = StructureBuilder.create()
-        builder.append(vt_ptr, "vtable")
-        if _attach_base_structures(bv, builder, class_name, rtti):
-            n_with_bases += 1
-            try:
-                bv.define_user_type(_qn(class_name), Type.structure_type(builder))
-            except Exception as e:
-                log.log_warn(f"[MSVC C++] pass2 redefine of {class_name} failed: {e}")
+        if op == HighLevelILOperation.HLIL_ADD:
+            left, right = dest.left, dest.right
+            if right.operation == HighLevelILOperation.HLIL_CONST:
+                return right.constant
+            if left.operation == HighLevelILOperation.HLIL_CONST:
+                return left.constant
 
-    log.log_info(
-        f"[MSVC C++] class structs: {n_built} built ({n_mi_promoted} from MI-only), "
-        f"{n_with_bases} with BaseStructures, "
-        f"{n_skipped_no_vt} skipped (no VTable type)"
-    )
-    return n_built
-
-
-_BaseStructure = None
-def _import_base_structure():
-    global _BaseStructure
-    if _BaseStructure is not None:
-        return _BaseStructure
-    for path in ("binaryninja.types", "binaryninja"):
-        try:
-            mod = __import__(path, fromlist=["BaseStructure"])
-            bs = getattr(mod, "BaseStructure", None)
-            if bs is not None:
-                _BaseStructure = bs
-                return bs
-        except Exception:
-            continue
+        if op in (HighLevelILOperation.HLIL_VAR, HighLevelILOperation.HLIL_CONST_PTR):
+            return 0
+    except Exception:
+        pass
     return None
 
 
-def _attach_base_structures(
-    bv: BinaryView,
-    builder: StructureBuilder,
-    class_name: str,
-    rtti: ClassGraph,
-) -> bool:
-    node = rtti.by_name.get(class_name)
-    if node is None or not node.bases:
-        return False
-
-    BaseStructure = _import_base_structure()
-    if BaseStructure is None:
-        log.log_warn(f"[MSVC C++] BaseStructure type not importable; skipping bases for {class_name}")
-        return False
-
-    bases = []
-    for b in node.bases:
-        base_qn = _qn(b.class_name)
-        base_t = bv.get_type_by_name(base_qn)
-        if base_t is None:
-            log.log_info(f"[MSVC C++] base {b.class_name} not yet registered (deferred); skipping for {class_name}")
-            continue
-        try:
-            base_ref = Type.named_type_from_registered_type(bv, base_qn)
-        except Exception as e:
-            log.log_debug(f"[MSVC C++] named ref for base {b.class_name} failed: {e}")
-            continue
-        width = getattr(base_t, "width", 0) or 0
-        if width <= 0:
-            log.log_info(f"[MSVC C++] base {b.class_name} width=0; using 8")
-            width = 8
-        try:
-            bases.append(BaseStructure(base_ref, b.class_offset, width))
-        except Exception as e:
-            log.log_warn(f"[MSVC C++] BaseStructure({b.class_name}, +{b.class_offset:#x}, w={width}) failed: {e}")
-
-    if not bases:
-        return False
+def _hlil_scan_for_vtable_assign(insn, target_addr: int):
+    """Recursively walk an HLIL instruction tree looking for an assignment of target_addr."""
+    _const_ops = (HighLevelILOperation.HLIL_CONST_PTR, HighLevelILOperation.HLIL_CONST)
     try:
-        builder.base_structures = bases
-        log.log_info(
-            f"[MSVC C++] {class_name}: attached {len(bases)} base(s) "
-            + ", ".join(f"{b.class_name}@+{b.class_offset:#x}" for b in node.bases)
+        if insn.operation == HighLevelILOperation.HLIL_ASSIGN:
+            src = insn.src
+            if src.operation in _const_ops and src.constant == target_addr:
+                return _extract_store_offset(insn.dest)
+        for op in insn.operands:
+            if hasattr(op, "operation"):
+                r = _hlil_scan_for_vtable_assign(op, target_addr)
+                if r is not None:
+                    return r
+    except Exception:
+        pass
+    return None
+
+
+def _mlil_find_vtable_store_offset(mlil, vtable_addr: int):
+    """Scan MLIL for a store of vtable_addr and return the destination byte offset."""
+    _const_ops = (
+        MediumLevelILOperation.MLIL_CONST_PTR,
+        MediumLevelILOperation.MLIL_CONST,
+    )
+    try:
+        for block in mlil:
+            for insn in block:
+                if insn.operation != MediumLevelILOperation.MLIL_STORE:
+                    continue
+                try:
+                    src = insn.src
+                    if src.operation not in _const_ops or src.constant != vtable_addr:
+                        continue
+                    dest = insn.dest
+                    if dest.operation == MediumLevelILOperation.MLIL_ADD:
+                        l, r = dest.left, dest.right
+                        if r.operation == MediumLevelILOperation.MLIL_CONST:
+                            return r.constant
+                        if l.operation == MediumLevelILOperation.MLIL_CONST:
+                            return l.constant
+                    elif dest.operation == MediumLevelILOperation.MLIL_VAR:
+                        return 0
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def find_class_offsets(bv: BinaryView, vtable_addrs: list) -> dict:
+    """Find where each vtable address is stored into an object, returning {vtable_addr: class_byte_offset}.
+
+    Scans referencing functions via HLIL first (typed struct field assignments),
+    then falls back to MLIL (raw memory stores) for cases HLIL constant-folds away.
+    """
+    result: dict[int, int] = {}
+    remaining = set(vtable_addrs)
+
+    for vtable_addr in list(vtable_addrs):
+        if vtable_addr not in remaining:
+            continue
+        for ref in bv.get_code_refs(vtable_addr):
+            func = ref.function
+            if func is None:
+                continue
+
+            if func.hlil is not None:
+                for block in func.hlil:
+                    for insn in block:
+                        offset = _hlil_scan_for_vtable_assign(insn, vtable_addr)
+                        if offset is not None:
+                            result[vtable_addr] = offset
+                            remaining.discard(vtable_addr)
+                            break
+                    if vtable_addr not in remaining:
+                        break
+
+            if vtable_addr not in remaining:
+                break
+
+            if func.mlil is not None:
+                offset = _mlil_find_vtable_store_offset(func.mlil, vtable_addr)
+                if offset is not None:
+                    result[vtable_addr] = offset
+                    remaining.discard(vtable_addr)
+
+            if vtable_addr not in remaining:
+                break
+
+    return result
+
+
+# Per-bv cache of {vtable_addr: class_byte_offset} stored on bv.session_data.
+_OFFSET_CACHE_KEY = "bn_msvc_cpp:class_offset_cache"
+
+
+def offset_cache(bv: BinaryView) -> dict:
+    cache = bv.session_data.get(_OFFSET_CACHE_KEY)
+    if cache is None:
+        cache = {}
+        bv.session_data[_OFFSET_CACHE_KEY] = cache
+    return cache
+
+
+# ---- Class + interface struct updates ---------------------------------
+
+def update_class_struct(bv: BinaryView, class_name: str, vtable_info: list) -> None:
+    """Add typed vtable pointer fields to the class struct.
+
+    vtable_info: [(vtable_addr, iface_name, struct_name, class_offset), ...]
+
+    Existing fields at vtable offsets are replaced ONLY if their name matches
+    a BN-auto-generated placeholder or our own previous-run output. Hand-named
+    fields are preserved so re-runs don't clobber user edits.
+    """
+    resolved: list[tuple] = []
+    for vtable_addr, iface_name, struct_name, class_offset in vtable_info:
+        if bv.get_type_by_name(struct_name) is None:
+            log_warn(
+                f"bn_msvc_cpp: type '{struct_name}' not found, skipping field in {class_name}"
+            )
+            continue
+        resolved.append((class_offset, iface_name, struct_name))
+
+    if not resolved:
+        return
+
+    vtable_offsets = {co for co, _, _ in resolved}
+
+    existing = bv.get_type_by_name(class_name)
+    if existing is not None and existing.type_class == TypeClass.NamedTypeReferenceClass:
+        existing = bv.get_type_by_name(str(existing.name))
+    builder = StructureBuilder.create()
+
+    existing_at: dict[int, str] = {}
+    if existing is not None and existing.type_class == TypeClass.StructureTypeClass:
+        builder.packed = getattr(existing, "packed", False)
+        for m in existing.members:
+            if m.offset in vtable_offsets:
+                existing_at[m.offset] = m.name
+                if not is_replaceable_field_name(m.name):
+                    builder.add_member_at_offset(m.name, m.type, m.offset)
+                continue
+            builder.add_member_at_offset(m.name, m.type, m.offset)
+
+    for class_offset, iface_name, struct_name in resolved:
+        if (
+            class_offset in existing_at
+            and not is_replaceable_field_name(existing_at[class_offset])
+        ):
+            continue
+        nt = Type.named_type_from_registered_type(bv, struct_name)
+        ptr_type = Type.pointer(bv.arch, nt)
+        if class_offset == 0:
+            field_name = "vtable"
+        else:
+            safe_iface = re.sub(r"[^a-zA-Z0-9_]", "_", strip_elaborated_type_keywords(iface_name))
+            field_name = f"vtable_{safe_iface}"
+        builder.add_member_at_offset(field_name, ptr_type, class_offset)
+
+    bv.define_user_type(class_name, builder)
+    log_info(
+        f"bn_msvc_cpp: updated {class_name} struct (+{len(resolved)} vtable pointer field(s))"
+    )
+
+
+def update_interface_struct(bv: BinaryView, iface_name: str, struct_name: str) -> None:
+    """Add a vtable pointer field at offset 0 to the interface struct.
+
+    Callers that hold an interface pointer (IFoo*) rather than the concrete class
+    pointer (Foo*) need the interface struct to have a vtable field so BN can
+    promote raw pointer arithmetic to named field accesses in HLIL.
+    """
+    if bv.get_type_by_name(struct_name) is None:
+        return
+
+    clean_iface = strip_elaborated_type_keywords(iface_name)
+    if not clean_iface:
+        return
+
+    existing = bv.get_type_by_name(clean_iface)
+    builder = StructureBuilder.create()
+    preserve_offset_0 = False
+
+    if existing is not None and existing.type_class == TypeClass.StructureTypeClass:
+        for m in existing.members:
+            if m.offset == 0:
+                if is_replaceable_field_name(m.name):
+                    continue
+                preserve_offset_0 = True
+                builder.add_member_at_offset(m.name, m.type, m.offset)
+                continue
+            builder.add_member_at_offset(m.name, m.type, m.offset)
+
+    if preserve_offset_0:
+        bv.define_user_type(clean_iface, builder)
+        return
+
+    nt = Type.named_type_from_registered_type(bv, struct_name)
+    ptr_type = Type.pointer(bv.arch, nt)
+    builder.add_member_at_offset("vtable", ptr_type, 0)
+    bv.define_user_type(clean_iface, builder)
+    log_info(f"bn_msvc_cpp: added vtable field to interface {clean_iface}")
+
+
+def auto_populate_class_struct(bv: BinaryView, class_name: str) -> bool:
+    """Run BN's "Create All Members for Structure" equivalent on the named class.
+
+    Calls bv.create_structure_from_offset_access (the public Python API behind the
+    'S' UI command) to infer field types from observed accesses through any
+    pointer typed as a NamedTypeReference to class_name, then re-registers the
+    result. This is what makes class struct fields appear at the offsets HLIL
+    was previously rendering as `__offset(N).d`.
+
+    Defensive: refuses to re-define if the inferred struct would drop any of the
+    existing members (vtable pointers in particular).
+
+    Returns True if the struct was populated (one or more new members added).
+    """
+    try:
+        existing = bv.get_type_by_name(class_name)
+        if existing is None or existing.type_class != TypeClass.StructureTypeClass:
+            return False
+        existing_offsets = {m.offset for m in existing.members}
+        new_struct = bv.create_structure_from_offset_access(class_name)
+        new_offsets = {m.offset for m in new_struct.members}
+
+        if not existing_offsets.issubset(new_offsets):
+            log_warn(
+                f"bn_msvc_cpp: auto-populate would drop existing fields in "
+                f"{class_name}, skipping (existing={sorted(existing_offsets)} "
+                f"new={sorted(new_offsets)})"
+            )
+            return False
+        added = new_offsets - existing_offsets
+        if not added:
+            return False
+        bv.define_user_type(class_name, new_struct)
+        log_info(
+            f"bn_msvc_cpp: auto-populated {class_name} (+{len(added)} field(s) "
+            f"from observed accesses)"
         )
         return True
     except Exception as e:
-        log.log_warn(f"[MSVC C++] base_structures setter failed for {class_name}: {e}")
+        log_warn(f"bn_msvc_cpp: auto-populate failed for {class_name}: {e}")
         return False
