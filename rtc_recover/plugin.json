@@ -1,0 +1,21 @@
+{
+    "pluginmetadataversion": 2,
+    "name": "RTC Name Recovery",
+    "type": ["helper"],
+    "api": ["python3"],
+    "description": "Recover original variable names from MSVC /RTC1 frame descriptors.",
+    "longdescription": "Walks `_RTC_CheckStackVars` / `_RTC_CheckStackVars2` frame descriptors emitted by MSVC `/RTC1` debug builds and renames matching Binary Ninja stack variables to their original source names. Registers two actions: 'RTC: Recover Names (Current Function)' and 'RTC: Recover Names (Whole Binary)'.",
+    "license": {
+        "name": "MIT",
+        "text": "Copyright (c) 2026 Z0F. Released under the MIT License."
+    },
+    "platforms": ["Darwin", "Linux", "Windows"],
+    "installinstructions": {
+        "Darwin": "",
+        "Linux": "",
+        "Windows": ""
+    },
+    "version": "0.1.0",
+    "author": "Z0F",
+    "minimumbinaryninjaversion": 3000
+}

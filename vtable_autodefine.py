@@ -45,8 +45,17 @@ from binaryninja.types import Type, StructureBuilder, FunctionParameter
 from binaryninja.interaction import show_message_box, get_choice_input
 from binaryninja.plugin import BackgroundTaskThread
 
-# Matches: "CMsiEngine::`vftable'" and "CMsiEngine::`vftable'{for `IMsiEngine'}"
-_VTABLE_RE = re.compile(r"^(.+?)::`vftable'(?:\{for `(.+?)'\})?$")
+# Matches: "CMsiEngine::`vftable'" and "CMsiEngine::`vftable'{for `IMsiEngine'}".
+# The optional trailing "::~`vftable'" handles a BN demangler quirk that
+# appears on `??_7` symbols for nested classes — BN renders them as
+# "Outer::Inner::`vftable'::~`vftable'" (treating the symbol as destructor-
+# like).  Without this, the FTMEventDelegate inside a WaitForCompletion<>
+# template falls through the regex and its address never enters
+# `all_sorted_addrs`, so the previous vtable overshoots into it and produces
+# a merged fat struct.
+_VTABLE_RE = re.compile(
+    r"^(.+?)::`vftable'(?:\{for `(.+?)'\})?(?:::~`vftable')?$"
+)
 
 # Maximum slots to scan forward when no bounding symbol is available
 _MAX_SLOTS = 512
@@ -55,6 +64,18 @@ _MAX_SLOTS = 512
 # Using session_data instead of a module-level dict avoids stale entries across
 # different open binaries and clears automatically when a binary is closed.
 _OFFSET_CACHE_KEY = "vtable_autodefine:class_offset_cache"
+
+# Cache key for `_rtti_col_vtable_addrs`'s output.  The COL scan iterates
+# `bv.data_vars` (potentially hundreds of thousands of entries on large
+# binaries), so caching the result for the duration of a plugin command
+# avoids paying the cost twice per "all classes" run.  Invalidated by
+# `_invalidate_col_cache` at the start of each top-level command, since
+# new data variables defined elsewhere could change the answer.
+_COL_VTABLE_CACHE_KEY = "vtable_autodefine:col_vtable_addrs"
+
+
+def _invalidate_col_cache(bv: BinaryView) -> None:
+    bv.session_data.pop(_COL_VTABLE_CACHE_KEY, None)
 
 
 def _check_arch(bv: BinaryView, title: str) -> bool:
@@ -85,26 +106,203 @@ _LLIL_STOP_OPS = {
 
 
 def _find_vtable_symbols(bv: BinaryView) -> dict:
-    """Return {class_name: [(addr, iface_name), ...]} sorted by address."""
+    """Return {class_name: [(addr, iface_name), ...]} sorted by address.
+
+    Both `class_name` and `iface_name` are canonicalized through
+    `_strip_elaborated_type_keywords` here so every downstream consumer sees
+    the same form.  Without this, BN's MSVC demangler intermittently emits
+    `{for `struct IFoo'}` (with elaborated keyword) while our slot-namespace
+    derivation always strips, causing spurious "renamed iface" log entries
+    and unnecessary re-stamps on each run.
+    """
     result: dict[str, list] = {}
     for sym in bv.get_symbols():
         m = _VTABLE_RE.match(sym.name)
         if m is None:
             continue
-        class_name = m.group(1)
-        iface_name = m.group(2) or class_name
+        class_name = _strip_elaborated_type_keywords(m.group(1))
+        iface_name = _strip_elaborated_type_keywords(m.group(2) or class_name)
         result.setdefault(class_name, []).append((sym.address, iface_name))
     for entries in result.values():
         entries.sort(key=lambda x: x[0])
     return result
 
 
-def _all_vtable_addrs(vtable_map: dict) -> list:
-    """Return all vtable start addresses sorted ascending."""
-    addrs = []
+def _rtti_col_vtable_addrs(bv: BinaryView) -> set:
+    """Return vtable start addresses inferred from RTTI Complete Object Locator
+    data variables.
+
+    In MSVC RTTI, every vtable is preceded by an 8-byte slot whose value is the
+    address of the class's `_RTTICompleteObjectLocator` (image-relative on x64).
+    The vtable body starts at that slot + 8.  BN's RTTI analysis labels each
+    COL data variable with a type whose name contains 'RTTICompleteObjectLocator',
+    so we can enumerate them and walk back via data references to locate every
+    vtable in the binary, including those for which BN never synthesized a
+    `'vftable'` symbol.
+
+    Without this, when BN labels only one of a class's multiple sibling vtables
+    (common for classes with multiple base interfaces / FtmBase compositions),
+    `_scan_vtable_slots` walks past the unlabeled boundary and merges the
+    adjacent vtables into a single fat struct.
+
+    Result is cached on `bv.session_data` for the duration of a command so
+    multiple call sites (`_attach_orphan_col_vtables`, `_all_vtable_addrs`)
+    don't each iterate `bv.data_vars` independently.
+    """
+    cached = bv.session_data.get(_COL_VTABLE_CACHE_KEY)
+    if cached is not None:
+        return cached
+    out: set = set()
+    for col_addr, var in bv.data_vars.items():
+        t = var.type
+        tname = ""
+        if t.type_class == TypeClass.NamedTypeReferenceClass:
+            tname = str(t.name)
+        elif t.type_class == TypeClass.StructureTypeClass:
+            reg = getattr(t, "registered_name", None)
+            tname = str(reg) if reg else ""
+        if "RTTICompleteObjectLocator" not in tname:
+            continue
+        for ref in bv.get_data_refs(col_addr):
+            out.add(ref + 8)
+    bv.session_data[_COL_VTABLE_CACHE_KEY] = out
+    return out
+
+
+# Maximum distance (in bytes) within which an orphan COL-derived vtable is
+# attached to the nearest symbolized vtable's class.  Sibling vtables of a
+# single class are laid out contiguously in .rdata, so a relatively small
+# window keeps the heuristic from cross-attaching vtables of unrelated classes
+# while still tolerating very large vtables (~500 slots).
+_ORPHAN_VTABLE_RADIUS = 0x1000
+
+
+def _attach_orphan_col_vtables(bv: BinaryView, vtable_map: dict) -> int:
+    """Attach COL-derived vtable addresses with no `'vftable'` symbol to the
+    nearest known class in vtable_map.
+
+    Boundary detection alone (see `_all_vtable_addrs`) is enough to stop the
+    slot scanner from merging adjacent vtables, but produces no struct type
+    for the unlabeled vtable.  This walks each orphan COL-derived address and
+    appends it to the nearest known class's entries (within
+    `_ORPHAN_VTABLE_RADIUS`) so `_process_class` will stamp a typed struct
+    and update the class struct with a vtable pointer field.
+
+    Returns the number of orphan vtables attached.
+    """
+    col_addrs = _rtti_col_vtable_addrs(bv)
+    if not col_addrs:
+        return 0
+    known: dict[int, str] = {}
+    for class_name, entries in vtable_map.items():
+        for addr, _ in entries:
+            known[addr] = class_name
+    if not known:
+        return 0
+    sorted_known = sorted(known.keys())
+
+    attached = 0
+    for addr in sorted(col_addrs):
+        if addr in known:
+            continue
+        nearest_class = None
+        best_dist: int | None = None
+        for k in sorted_known:
+            d = abs(k - addr)
+            if best_dist is None or d < best_dist:
+                best_dist = d
+                nearest_class = known[k]
+            if k > addr and best_dist is not None and (k - addr) >= best_dist:
+                break
+        if nearest_class is None or best_dist is None or best_dist > _ORPHAN_VTABLE_RADIUS:
+            continue
+        # Use class_name as a placeholder iface_name; _process_class will
+        # rename adjustor-thunk-prefixed (secondary) vtables to their real
+        # base interface name based on slot 3's namespace.
+        vtable_map[nearest_class].append((addr, nearest_class))
+        attached += 1
+
+    for entries in vtable_map.values():
+        entries.sort(key=lambda x: x[0])
+    return attached
+
+
+def _is_adjustor_thunk_slot(bv: BinaryView, vtable_addr: int, slot_idx: int = 0) -> bool:
+    """Return True if vtable[slot_idx] points to an adjustor thunk.
+
+    Adjustor thunks have BN-demangled symbol names starting with `[thunk]:`
+    and containing `adjustor`, e.g.
+    `[thunk]:Foo::QueryInterface\`adjustor{8}'`.  A vtable whose first slot is
+    an adjustor thunk is the secondary vtable for a base subobject reached at
+    a non-zero `this` offset; the thunk subtracts that offset before tail-
+    calling the most-derived implementation.
+    """
+    raw = bv.read(vtable_addr + slot_idx * 8, 8)
+    if not raw or len(raw) < 8:
+        return False
+    fp = int.from_bytes(raw, "little")
+    if fp == 0:
+        return False
+    sym = bv.get_symbol_at(fp)
+    if sym is None:
+        return False
+    name = f"{sym.full_name or ''} {sym.short_name or ''}"
+    return "adjustor" in name.lower()
+
+
+def _slot_func_namespace(bv: BinaryView, vtable_addr: int, slot_idx: int) -> str | None:
+    """Return the qualified class namespace (everything except the trailing
+    `::method`) of the function at vtable[slot_idx], or None.
+
+    Used to recover the real interface name for a secondary vtable: its
+    IUnknown trio is implementation-class-qualified (via adjustor thunks),
+    but slots 3+ are interface methods qualified by the interface class
+    itself, e.g.
+    `Microsoft::WRL::FtmBase::GetUnmarshalClass` -> `Microsoft::WRL::FtmBase`.
+    """
+    raw = bv.read(vtable_addr + slot_idx * 8, 8)
+    if not raw or len(raw) < 8:
+        return None
+    fp = int.from_bytes(raw, "little")
+    if fp == 0:
+        return None
+    func = bv.get_function_at(fp)
+    if func is None:
+        return None
+    fname = func.name
+    if fname.startswith("?"):
+        # demangle_ms returns either a list of qualified-name parts or a flat
+        # string depending on the symbol shape; handle both shapes.
+        try:
+            _, parts = demangle_ms(bv.arch, fname)
+            if isinstance(parts, list):
+                fname = "::".join(parts)
+            elif isinstance(parts, str):
+                fname = parts
+        except Exception:
+            pass
+    if fname.startswith("[thunk]:"):
+        fname = fname[len("[thunk]:"):]
+    fname = re.sub(r"`adjustor\{\d+\}'$", "", fname).rstrip(":")
+    if "::" not in fname:
+        return None
+    return _strip_elaborated_type_keywords("::".join(fname.split("::")[:-1]))
+
+
+def _all_vtable_addrs(vtable_map: dict, bv: BinaryView) -> list:
+    """Return all vtable start addresses sorted ascending.
+
+    Includes both addresses derived from RTTI `'vftable'` symbols and
+    addresses inferred from RTTI Complete Object Locator data variables —
+    necessary because BN's RTTI analysis sometimes labels only one of
+    multiple sibling vtables for a class with multiple bases.  The merged
+    list is used by `_compute_slot_counts` as a per-vtable upper bound.
+    """
+    addrs = set()
     for entries in vtable_map.values():
         for addr, _ in entries:
-            addrs.append(addr)
+            addrs.add(addr)
+    addrs.update(_rtti_col_vtable_addrs(bv))
     return sorted(addrs)
 
 
@@ -202,6 +400,134 @@ def _slot_field_name(bv: BinaryView, func: "Function", slot_index: int) -> str:
     if not base or base[0].isdigit():
         base = f"slot_{slot_index}"
     return base
+
+
+def _is_generic_field_name(name: str) -> bool:
+    """Return True if `name` is a placeholder we should overwrite with a
+    descriptive sibling name during unification.
+
+    Matches `_purecall` / `o__purecall` (MSVC's pure-virtual stub used to fill
+    abstract base vtable slots that the derived class is expected to override)
+    and `slot_N` (used when no function symbol was available).  Real method
+    names like `Invoke` are left alone.
+    """
+    if not name:
+        return True
+    if "purecall" in name.lower():
+        return True
+    if re.fullmatch(r"slot_\d+", name):
+        return True
+    return False
+
+
+def _unify_purecall_slots(bv: BinaryView, all_vtable_info: list) -> int:
+    """Mirror descriptive slot names across vtables that share the same
+    IUnknown trio (slot 0/1/2 function pointers).
+
+    Two vtables with identical QI/AddRef/Release function pointers are sibling
+    vtables for the same most-derived class.  When one is the abstract base's
+    primary vtable (filled with `_purecall` placeholders that XFG-resolves to
+    derived overrides at runtime) and another is a concrete derived class's
+    vtable (with real implementations), this pass copies the descriptive slot
+    names from the concrete vtable to the abstract one.
+
+    Result: a pointer typed as the abstract `IFoo::VTable*` renders calls as
+    `vtable->Invoke(...)` instead of `vtable->o__purecall()`, matching the
+    interface contract that XFG already enforces at runtime.
+
+    `all_vtable_info` is the aggregate of `(vtable_addr, iface_name,
+    struct_name, n_slots)` tuples from `_process_class` across all classes.
+    Returns the number of structs whose field names were updated.
+    """
+    if not all_vtable_info:
+        return 0
+
+    # Group vtables by their IUnknown trio + slot count.  `n_slots` is added
+    # to the key as a defensive guard against MSVC `/OPT:ICF` (Identical
+    # COMDAT Folding), which collapses byte-identical QI/AddRef/Release
+    # bodies across unrelated classes.  An ICF-collapsed trio alone could
+    # group two vtables for entirely different interfaces; requiring the
+    # slot counts to match too eliminates that collision in the common case
+    # where different interfaces have different vtable sizes.  (Two
+    # interfaces with the same method count and an ICF-collapsed trio can
+    # still collide here, so users with that specific layout should treat
+    # mirrored names as a hint, not authoritative.)
+    groups: dict[tuple, list] = {}
+    for vtable_addr, _iface_name, struct_name, n_slots in all_vtable_info:
+        if n_slots < 3:
+            continue
+        trio = []
+        ok = True
+        for i in range(3):
+            raw = bv.read(vtable_addr + i * 8, 8)
+            if not raw or len(raw) < 8:
+                ok = False
+                break
+            trio.append(int.from_bytes(raw, "little"))
+        if not ok:
+            continue
+        groups.setdefault((tuple(trio), n_slots), []).append(
+            (vtable_addr, struct_name, n_slots)
+        )
+
+    updated = 0
+    for _key, members in groups.items():
+        if len(members) < 2:
+            # Single vtable in this group — nothing to mirror from.
+            continue
+        # Build slot_idx -> first descriptive name across the group.
+        max_slots = max(n for _, _, n in members)
+        slot_best: dict[int, str] = {}
+        for slot_idx in range(max_slots):
+            for vtable_addr, _struct_name, n_slots in members:
+                if slot_idx >= n_slots:
+                    continue
+                raw = bv.read(vtable_addr + slot_idx * 8, 8)
+                if not raw or len(raw) < 8:
+                    continue
+                fp = int.from_bytes(raw, "little")
+                func = bv.get_function_at(fp) if fp else None
+                if func is None:
+                    continue
+                name = _slot_field_name(bv, func, slot_idx)
+                if _is_generic_field_name(name):
+                    continue
+                slot_best[slot_idx] = name
+                break
+        if not slot_best:
+            continue
+
+        # Re-stamp each struct in this group, replacing only generic names
+        # so user-curated names and previously-unified names are preserved.
+        for _vtable_addr, struct_name, _n_slots in members:
+            t = bv.get_type_by_name(struct_name)
+            if t is None:
+                continue
+            if t.type_class == TypeClass.NamedTypeReferenceClass:
+                t = bv.get_type_by_name(str(t.name))
+                if t is None:
+                    continue
+            if t.type_class != TypeClass.StructureTypeClass:
+                continue
+            builder = StructureBuilder.create()
+            builder.packed = getattr(t, "packed", True)
+            changed = False
+            for m in t.members:
+                slot_idx = m.offset // 8
+                desired = slot_best.get(slot_idx)
+                if desired is not None and _is_generic_field_name(m.name) and desired != m.name:
+                    builder.add_member_at_offset(desired, m.type, m.offset)
+                    changed = True
+                else:
+                    builder.add_member_at_offset(m.name, m.type, m.offset)
+            if changed:
+                bv.define_user_type(struct_name, builder)
+                updated += 1
+                log_info(
+                    f"vtable_autodefine: unified placeholder slot names in "
+                    f"{struct_name}"
+                )
+    return updated
 
 
 def _create_vtable_struct(
@@ -389,15 +715,35 @@ def _find_class_offsets(bv: BinaryView, vtable_addrs: list) -> dict:
     return result
 
 
+# Patterns BN's "Create All Members" / structure-from-offset analysis emits
+# for fields it inferred without a name.  Replacing these with our typed
+# vtable pointers is desirable; replacing a field a user has hand-named is
+# not (idempotency).  If a vtable-offset field doesn't match one of these,
+# we leave it alone.
+_AUTO_FIELD_RE = re.compile(
+    r"^(?:offset_[0-9a-fA-F]+|field_[0-9a-fA-F]+|__offset\(.*\)\.[a-z]+|vtable(?:_[A-Za-z0-9_]+)?)$"
+)
+
+
+def _is_replaceable_field_name(name: str) -> bool:
+    """Return True if `name` is a BN-auto-generated placeholder OR our own
+    previous-run output (`vtable`, `vtable_<iface>`).  User-curated names are
+    left alone so re-running the plugin doesn't clobber manual edits."""
+    if not name:
+        return True
+    return bool(_AUTO_FIELD_RE.match(name))
+
+
 def _update_class_struct(bv: BinaryView, class_name: str, vtable_info: list) -> None:
     """Add typed vtable pointer fields to the class struct.
 
     vtable_info: [(vtable_addr, iface_name, struct_name, class_offset), ...]
 
-    Overwrites existing fields at vtable offsets only for entries whose struct type
-    resolves successfully - BN auto-generated fields (offset_0, field_0) that block
-    our typed pointers are replaced; offsets where type lookup fails are left untouched
-    rather than being cleared without a replacement.
+    Existing fields at vtable offsets are replaced ONLY if their name matches
+    a BN-auto-generated placeholder (offset_0, field_0, __offset(N).d) or our
+    own previous-run output (vtable, vtable_<iface>).  Hand-named fields are
+    preserved so re-runs don't clobber user edits.  Offsets where type lookup
+    fails are left untouched rather than being cleared without a replacement.
     """
     resolved: list[tuple] = []
     for vtable_addr, iface_name, struct_name, class_offset in vtable_info:
@@ -420,14 +766,27 @@ def _update_class_struct(bv: BinaryView, class_name: str, vtable_info: list) -> 
         existing = bv.get_type_by_name(str(existing.name))
     builder = StructureBuilder.create()
 
+    # Snapshot existing field names so we can decide per-offset whether to
+    # overwrite (auto/own placeholder) or preserve (user-curated).
+    existing_at: dict[int, str] = {}
     if existing is not None and existing.type_class == TypeClass.StructureTypeClass:
         builder.packed = getattr(existing, "packed", False)
         for m in existing.members:
             if m.offset in vtable_offsets:
+                existing_at[m.offset] = m.name
+                if not _is_replaceable_field_name(m.name):
+                    # User-named — keep it as-is.
+                    builder.add_member_at_offset(m.name, m.type, m.offset)
                 continue
             builder.add_member_at_offset(m.name, m.type, m.offset)
 
     for class_offset, iface_name, struct_name in resolved:
+        if (
+            class_offset in existing_at
+            and not _is_replaceable_field_name(existing_at[class_offset])
+        ):
+            # Already preserved above; skip the typed-pointer overwrite.
+            continue
         nt = Type.named_type_from_registered_type(bv, struct_name)
         ptr_type = Type.pointer(bv.arch, nt)
         if class_offset == 0:
@@ -461,12 +820,22 @@ def _update_interface_struct(bv: BinaryView, iface_name: str, struct_name: str) 
 
     existing = bv.get_type_by_name(clean_iface)
     builder = StructureBuilder.create()
+    preserve_offset_0 = False
 
     if existing is not None and existing.type_class == TypeClass.StructureTypeClass:
         for m in existing.members:
             if m.offset == 0:
-                continue  # will be replaced with our typed vtable pointer
+                if _is_replaceable_field_name(m.name):
+                    continue  # auto/own placeholder — replace below
+                # User-named (e.g. 'vptr', 'vfptr') — preserve and skip overwrite
+                preserve_offset_0 = True
+                builder.add_member_at_offset(m.name, m.type, m.offset)
+                continue
             builder.add_member_at_offset(m.name, m.type, m.offset)
+
+    if preserve_offset_0:
+        bv.define_user_type(clean_iface, builder)
+        return
 
     nt = Type.named_type_from_registered_type(bv, struct_name)
     ptr_type = Type.pointer(bv.arch, nt)
@@ -717,6 +1086,26 @@ def _process_class(
                 f"vtable_autodefine: {class_name}/{iface_name} @ {vtable_addr:#x} - 0 slots, skipping"
             )
             continue
+        # Secondary (adjustor-thunk) vtables: rename the inferred iface so the
+        # struct ends up named after the actual base interface (e.g.
+        # 'Microsoft::WRL::FtmBase::VTable') rather than the most-derived class.
+        # Otherwise consumers who type a pointer as the most-derived class's
+        # 'VTable' end up reading a struct that begins with adjustor thunks for
+        # a different subobject — exactly the misleading-top-level-type case
+        # that happens for FtmBase composites.  pre_existing_names wins because
+        # BN's PDB or a prior run may have already settled on a canonical name.
+        if (
+            vtable_addr not in pre_existing_names
+            and n_slots > 3
+            and _is_adjustor_thunk_slot(bv, vtable_addr)
+        ):
+            secondary_iface = _slot_func_namespace(bv, vtable_addr, 3)
+            if secondary_iface and secondary_iface != iface_name:
+                log_info(
+                    f"vtable_autodefine: secondary vtable @ {vtable_addr:#x} "
+                    f"({class_name}) renamed iface {iface_name!r} -> {secondary_iface!r}"
+                )
+                iface_name = secondary_iface
         struct_name = pre_existing_names.get(vtable_addr) or _vtable_struct_name(iface_name)
         funcs = _create_vtable_struct(bv, vtable_addr, struct_name, n_slots)
         all_funcs.update(funcs)
@@ -788,6 +1177,7 @@ def _process_class(
         len(created),
         all_funcs,
         f"{class_name}: {len(created)} vtable(s) [{slot_counts}]",
+        created,
     )
 
 
@@ -862,10 +1252,17 @@ def _do_process_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
         )
         return
 
-    all_sorted = _all_vtable_addrs(vtable_map)
+    attached = _attach_orphan_col_vtables(bv, vtable_map)
+    if attached:
+        log_info(
+            f"vtable_autodefine: attached {attached} unsymbolized COL-derived "
+            f"vtable(s) to nearest known class"
+        )
+    all_sorted = _all_vtable_addrs(vtable_map, bv)
 
     bv.begin_undo_actions()
     all_funcs: set = set()
+    all_created: list = []
     summaries = []
     total_structs = 0
     total_classes = len(vtable_map)
@@ -874,11 +1271,24 @@ def _do_process_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
         if task.cancelled:
             break
         task.progress = f"VTables: processing {i}/{total_classes} - {class_name}"
-        n, funcs, msg = _process_class(bv, class_name, entries, all_sorted)
+        n, funcs, msg, created = _process_class(bv, class_name, entries, all_sorted)
         total_structs += n
         all_funcs.update(funcs)
+        all_created.extend(created)
         summaries.append(msg)
         log_info(f"vtable_autodefine: {msg}")
+
+    # Cross-class post-pass: mirror descriptive slot names onto vtables that
+    # have `_purecall` placeholders, when an IUnknown-trio-matching sibling
+    # vtable provides a better name.  Runs once across the global aggregate so
+    # one class's concrete vtable can rename another class's abstract vtable.
+    task.progress = "VTables: unifying _purecall slot names..."
+    unified = _unify_purecall_slots(bv, all_created)
+    if unified:
+        log_info(
+            f"vtable_autodefine: unified placeholder slot names in "
+            f"{unified} struct(s)"
+        )
 
     task.progress = f"VTables: queueing re-analysis for {len(all_funcs)} function(s)..."
     for func in all_funcs:
@@ -908,15 +1318,20 @@ def _do_process_all(bv: BinaryView, task: BackgroundTaskThread) -> None:
                 populated += 1
         bv.commit_undo_actions()
         if populated:
-            bv.update_analysis()
+            # Block here so the user sees the HLIL field-access promotions
+            # immediately rather than staring at half-promoted output while
+            # BN re-lifts in the background.  Each `_auto_populate_class_struct`
+            # in the loop above does its own `define_user_type`, which
+            # invalidates downstream type references; one wait at the end
+            # lets BN catch up on the entire batch in a single pass.
+            bv.update_analysis_and_wait()
 
     show_message_box(
         "Auto-Define Vtable Structs",
         f"Processed {total_classes} class(es), {total_structs} vtable struct(s), "
         f"auto-populated {populated} class struct(s)"
         f"{' (cancelled)' if task.cancelled else ''}.\n\n"
-        "Re-analysis queued - wait for BN's analysis indicator to finish,\n"
-        "then check HLIL for promoted vtable field accesses.",
+        "Check HLIL for promoted vtable field accesses.",
     )
 
 
@@ -924,6 +1339,7 @@ def _cmd_process_all(bv: BinaryView) -> None:
     """Process every class with RTTI vtable symbols in the binary."""
     if not _check_arch(bv, "Auto-Define Vtable Structs"):
         return
+    _invalidate_col_cache(bv)
 
     class _Task(BackgroundTaskThread):
         def __init__(self) -> None:
@@ -942,7 +1358,8 @@ def _do_process_for_address(bv: BinaryView, addr: int, task: BackgroundTaskThrea
     """Background worker for Auto-Define Vtable Structs for one class."""
     task.progress = "VTables: scanning for RTTI vtable symbols..."
     vtable_map = _find_vtable_symbols(bv)
-    all_sorted = _all_vtable_addrs(vtable_map)
+    _attach_orphan_col_vtables(bv, vtable_map)
+    all_sorted = _all_vtable_addrs(vtable_map, bv)
 
     class_name = None
     funcs = bv.get_functions_containing(addr)
@@ -961,9 +1378,21 @@ def _do_process_for_address(bv: BinaryView, addr: int, task: BackgroundTaskThrea
 
     task.progress = f"VTables: processing {class_name}"
     bv.begin_undo_actions()
-    n, funcs_set, msg = _process_class(
+    n, funcs_set, msg, created = _process_class(
         bv, class_name, vtable_map[class_name], all_sorted
     )
+    # Per-class unification still helps when a single class has both an
+    # abstract base vtable and a concrete derived vtable that share an
+    # IUnknown trio (typical for WRL RuntimeClass + nested implementing
+    # delegates).  Cross-class unification only runs from the all-classes
+    # entry point, which is fine — running it here would force scanning
+    # every other class's vtables on a single-class request.
+    unified = _unify_purecall_slots(bv, created)
+    if unified:
+        log_info(
+            f"vtable_autodefine: unified placeholder slot names in "
+            f"{unified} struct(s)"
+        )
     for func in funcs_set:
         func.mark_caller_updates_required(FunctionUpdateType.UserFunctionUpdate)
     bv.commit_undo_actions()
@@ -987,6 +1416,7 @@ def _cmd_process_for_address(bv: BinaryView, addr: int) -> None:
     """Process the vtable structs for the class whose method contains addr."""
     if not _check_arch(bv, "Auto-Define Vtable Structs"):
         return
+    _invalidate_col_cache(bv)
 
     class _Task(BackgroundTaskThread):
         def __init__(self) -> None:
@@ -1216,6 +1646,7 @@ def _cmd_navigate_to_virtual(bv: BinaryView, addr: int) -> None:
     """
     if not _check_arch(bv, "Navigate to Virtual Function"):
         return
+    _invalidate_col_cache(bv)
     slot_offset, vtable_class_offset = _get_vtable_dispatch_info(bv, addr)
     if slot_offset is None:
         show_message_box(
@@ -1235,6 +1666,10 @@ def _cmd_navigate_to_virtual(bv: BinaryView, addr: int) -> None:
         return
 
     vtable_map = _find_vtable_symbols(bv)
+    # Pull orphan COL-derived vtables into vtable_map so the navigate-to-virtual
+    # narrow-by-calling-class step sees every sibling vtable (primary + secondary
+    # vtables for multi-base classes), not only the ones BN's RTTI labeled.
+    _attach_orphan_col_vtables(bv, vtable_map)
     calling_class = _get_calling_class(bv, addr, vtable_map)
     class_vtable_addrs: set[int] = set()
     vtable_to_class_offset: dict[int, int] = {}
